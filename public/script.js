@@ -635,6 +635,7 @@ let currentAttachment = null;
 let voiceEnabled = true;
 let ttsVoice = localStorage.getItem('ttsVoice') || 'ash';
 let voiceRealtimeAvailable = false;
+let _autoVoiceStarted = false; // fires once on page load
 
 // Realtime API supports a different voice set than TTS.
 // Map TTS voice to nearest valid Realtime voice.
@@ -827,7 +828,9 @@ function initConclaveToggle() {
 }
 
 // ========== LANGUAGE STATE ==========
-let currentLang = localStorage.getItem('jarvis-lang') || 'BR';
+// LOCKED to Portuguese-BR by user directive (single-language mode)
+localStorage.setItem('jarvis-lang', 'BR');
+let currentLang = 'BR';
 
 function initLangToggle() {
   const enBtn = document.getElementById('lang-en');
@@ -1320,7 +1323,10 @@ function _scheduleAudio(f32) {
   src.start(realtimePlayNext);
   realtimePlayNext += buf.duration;
   src.onended = () => {
-    if (realtimePlayNext <= ctx.currentTime) setAvatarState('idle');
+    if (realtimePlayNext <= ctx.currentTime) {
+      // All audio drained — if Realtime still active go back to listening, else idle
+      setAvatarState(realtimeActive ? 'listening' : 'idle');
+    }
   };
 }
 
@@ -1344,33 +1350,55 @@ function _handleRealtimeEvent(ev) {
       stopRealtime(); return;
     }
     if (ev.type === 'input_audio_buffer.speech_started') setAvatarState('listening');
+    if (ev.type === 'input_audio_buffer.speech_stopped')  setAvatarState('thinking');
     if (ev.type === 'response.audio.delta' && ev.delta) {
       setAvatarState('speaking');
       _scheduleAudio(_pcm16ToFloat32(ev.delta));
     }
     if (ev.type === 'response.audio.done') {
-      // playback drains naturally; avatar state set via onended
+      // audio drains naturally; response.done will reset to listening
+    }
+    if (ev.type === 'response.done') {
+      // After every response, go back to listening immediately
+      setTimeout(() => {
+        if (realtimeActive) setAvatarState('listening');
+      }, 120); // small delay so last audio chunk finishes
     }
     if (ev.type === 'response.audio_transcript.done' && ev.transcript) {
       addTerminalLine(ev.transcript, 'jarvis-line');
     }
     if (ev.type === 'conversation.item.input_audio_transcription.completed' && ev.transcript) {
       addTerminalLine('> ' + ev.transcript, 'user-line');
+      // Ambient learning: record what user said + current screen context to memory
+      fetch('/api/observation', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ utterance: ev.transcript, language: currentLang })
+      }).catch(() => {});
     }
     if (ev.type === 'response.function_call_arguments.done' && ev.name === 'execute_task') {
       handleRealtimeTask(ev.call_id, ev.arguments);
     }
     if (ev.type === 'error') {
       console.warn('[JARVIS] Realtime server error:', ev.error);
+      const code = ev.error?.code || '';
+      const type = ev.error?.type || '';
+      // Hard fallback on rate limit, quota, auth, OR server_error (gpt-realtime bug)
+      const fatal = code === 'rate_limit_exceeded' || code === 'insufficient_quota'
+                 || code === 'invalid_api_key' || type === 'server_error';
+      if (fatal) {
+        voiceRealtimeAvailable = false;
+        realtimeUserDisabled = true;
+        addTerminalLine('[system] ⚠️ Realtime indisponível (' + (code || type) + ') — usando STT contínuo', 'system-line');
+        stopRealtime();
+        setTimeout(() => { realtimeUserDisabled = false; _activateContinuousSTT(); }, 200);
+      }
     }
   } catch(e) { console.warn('[JARVIS] Event parse error:', e); }
 }
 
 async function startRealtime() {
-  if (realtimeActive) { realtimeUserDisabled = true; return stopRealtime(); }
   if (realtimeConnecting) return;
   realtimeConnecting = true;
-  realtimeUserDisabled = false;
   try {
     userGestureReceived = true;
 
@@ -1386,14 +1414,24 @@ async function startRealtime() {
     };
     realtimeWs.onerror = () => { addTerminalLine('[error] Realtime WebSocket error', 'error-line'); stopRealtime(); };
     realtimeWs.onclose = (ev) => {
-      if (ev.code === 4000 || ev.code === 4001 || ev.code === 4003) {
-        // OpenAI: account sem acesso GA — desativa realtime e usa push-to-talk
-        voiceRealtimeAvailable = false;
-        addTerminalLine('[system] Realtime indisponível nesta conta — usando push-to-talk (STT+TTS)', 'system-line');
-        const sVoice = document.getElementById('bar-voice-status');
-        if (sVoice) { sVoice.textContent = 'STT'; }
-      }
+      const wasActive = realtimeActive;
       stopRealtime();
+      if (realtimeUserDisabled) return; // usuário desligou manualmente
+
+      if (ev.code === 4000 || ev.code === 4001 || ev.code === 4003 || ev.code === 1013) {
+        // Sem acesso Realtime ou rate limit — cai para STT contínuo
+        voiceRealtimeAvailable = false;
+        addTerminalLine('[system] Realtime indisponível (' + ev.code + ') — usando STT contínuo', 'system-line');
+        _activateContinuousSTT();
+        return;
+      }
+      // Queda inesperada — reconecta automaticamente
+      if (wasActive) {
+        addTerminalLine('[system] Reconectando...', 'system-line');
+        setTimeout(() => {
+          if (!realtimeActive && !realtimeConnecting && !realtimeUserDisabled) startRealtime();
+        }, 1500);
+      }
     };
 
     // PCM16 capture via AudioContext ScriptProcessor (24kHz)
@@ -1405,20 +1443,32 @@ async function startRealtime() {
       if (realtimeWs?.readyState !== WebSocket.OPEN) return;
       const f32 = e.inputBuffer.getChannelData(0);
       const int16 = new Int16Array(f32.length);
-      for (let i = 0; i < f32.length; i++) int16[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)));
+      for (let i = 0; i < f32.length; i++) {
+        int16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32767 | 0));
+      }
+      // Fast base64 without string concat
       const bytes = new Uint8Array(int16.buffer);
-      let bin = '';
-      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-      realtimeWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
+      const CHUNK = 8192;
+      let base64 = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        base64 += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      realtimeWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(base64) }));
     };
     source.connect(realtimeProcessor);
     realtimeProcessor.connect(realtimeAudioCtx.destination);
 
     addTerminalLine('[system] Conectando voz contínua...', 'system-line');
   } catch (err) {
-    addTerminalLine('[error] Realtime: ' + err.message, 'error-line');
     realtimeConnecting = false;
     stopRealtime();
+    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+      addTerminalLine('[system] ⚠️ Microfone bloqueado — ative em Sistema > Privacidade > Microfone', 'system-line');
+      // Mic denied — don't retry Realtime, just stay idle
+      micBtn.classList.remove('recording');
+      return;
+    }
+    addTerminalLine('[error] Realtime: ' + err.message, 'error-line');
   }
 }
 
@@ -1559,7 +1609,7 @@ async function startRecording() {
           webSpeechRec = null;
           // Continuous mode: restart after brief pause
           if (continuousMode) {
-            continuousTimer = setTimeout(() => startRecording(), 800);
+            continuousTimer = setTimeout(() => startRecording(), 200);
           }
         }
       };
@@ -1568,8 +1618,12 @@ async function startRecording() {
       isRecording = true;
       micBtn.classList.add('recording');
       setAvatarState('listening');
-      playTone(1200, 40);
-      addTerminalLine('[system] Listening (real-time)...', 'system-line');
+      // Only announce listening once per continuous session (not every cycle)
+      if (!window._sttCycleSilent) {
+        playTone(1200, 40);
+        addTerminalLine('[system] Listening (real-time)...', 'system-line');
+        window._sttCycleSilent = true;
+      }
       return;
     }
 
@@ -1848,10 +1902,23 @@ function startWakeWord() {
   };
 
   wakeWordRecognition.onend = () => {
-    if (wakeWordEnabled) wakeWordRecognition.start();
+    // Don't restart if user disabled, or if mic is busy (Realtime/continuous/recording)
+    if (!wakeWordEnabled) return;
+    if (realtimeActive || realtimeConnecting || continuousMode || isRecording) return;
+    // Debounce restart to prevent rapid-fire restart loop (beep source)
+    setTimeout(() => {
+      if (!wakeWordEnabled || realtimeActive || realtimeConnecting || continuousMode || isRecording) return;
+      try { wakeWordRecognition?.start(); } catch {}
+    }, 500);
+  };
+  wakeWordRecognition.onerror = (e) => {
+    // 'no-speech' is normal; 'aborted' happens when something else takes the mic — skip restart in those cases
+    if (e.error === 'not-allowed' || e.error === 'audio-capture') {
+      wakeWordEnabled = false;
+    }
   };
 
-  wakeWordRecognition.start();
+  try { wakeWordRecognition.start(); } catch {}
 }
 
 function stopWakeWord() {
@@ -2106,28 +2173,120 @@ chatInput.addEventListener('keydown', (e) => {
   }
 });
 
-micBtn.addEventListener('click', () => {
+micBtn.addEventListener('click', async () => {
   userGestureReceived = true;
+
+  // ── DESLIGAR: qualquer modo ativo ──
+  if (realtimeActive || continuousMode || isRecording) {
+    realtimeUserDisabled = true;
+    if (realtimeActive) stopRealtime();
+    if (continuousMode) { continuousMode = false; }
+    if (isRecording) { try { stopRecording(); } catch {} }
+    micBtn.classList.remove('recording');
+    setAvatarState('idle');
+    addTerminalLine('[system] Voz desativada.', 'system-line');
+    return;
+  }
+
+  if (realtimeConnecting) return;
+
+  // ── LIGAR: feedback imediato + tenta Realtime, fallback STT ──
+  micBtn.classList.add('recording');
+  setAvatarState('listening');
+  realtimeUserDisabled = false;
+
   if (voiceRealtimeAvailable) {
-    micBtn.classList.toggle('recording');
-    addTerminalLine(realtimeActive ? '[system] Desconectando voz...' : '[system] Conectando voz...', 'system-line');
-    startRealtime().then(() => {
-      if (realtimeActive) micBtn.classList.add('recording');
-      else micBtn.classList.remove('recording');
-    }).catch((err) => {
-      micBtn.classList.remove('recording');
-      addTerminalLine(`[error] Voz: ${err.message || err}`, 'error-line');
-    });
-  } else {
-    // Realtime indisponível — usa push-to-talk com Web Speech / Whisper
-    if (isRecording) {
-      stopRecording();
-    } else {
-      addTerminalLine('[system] Ouvindo... (clique novamente para enviar)', 'system-line');
-      startRecording();
+    addTerminalLine('[system] Ativando voz contínua...', 'system-line');
+    try {
+      await startRealtime();
+    } catch (err) {
+      if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
+        addTerminalLine('[error] Microfone bloqueado — System Settings > Privacidade > Microfone > JARVIS', 'error-line');
+        micBtn.classList.remove('recording');
+        setAvatarState('idle');
+        return;
+      }
+      addTerminalLine('[system] Realtime indisponível — usando STT contínuo', 'system-line');
+      _activateContinuousSTT();
     }
+  } else {
+    _activateContinuousSTT();
   }
 });
+
+// ===== AMBIENT INDICATOR — floating "👁 OBSERVANDO" pill =====
+if (!document.getElementById('ambient-pill')) {
+  const pill = document.createElement('div');
+  pill.id = 'ambient-pill';
+  pill.innerHTML = '<span class="eye">👁</span><span class="lbl">OBSERVANDO</span>';
+  pill.style.cssText = 'position:fixed;top:14px;right:14px;z-index:9999;background:rgba(0,20,40,0.85);border:1px solid rgba(0,228,255,0.5);color:#00e4ff;padding:6px 12px;border-radius:14px;font:600 11px/1 ui-monospace,monospace;letter-spacing:1px;display:flex;gap:8px;align-items:center;backdrop-filter:blur(6px);transition:opacity .3s;opacity:0;pointer-events:none';
+  const style = document.createElement('style');
+  style.textContent = '#ambient-pill .eye{animation:eyePulse 2s ease-in-out infinite}@keyframes eyePulse{0%,100%{opacity:.6;text-shadow:0 0 4px rgba(0,228,255,.4)}50%{opacity:1;text-shadow:0 0 12px rgba(0,228,255,.9)}}';
+  document.head.appendChild(style);
+  document.body.appendChild(pill);
+  // Toggle visibility based on mic state
+  setInterval(() => {
+    const on = (typeof realtimeActive !== 'undefined' && realtimeActive) ||
+               (typeof continuousMode !== 'undefined' && continuousMode) ||
+               (typeof isRecording !== 'undefined' && isRecording);
+    pill.style.opacity = on ? '1' : '0';
+  }, 500);
+}
+
+// ===== ALWAYS-ON WATCHDOG — re-arm mic if it dies unexpectedly =====
+// Runs once on page load; checks every 8s that some voice mode is active.
+if (!window._jarvisAlwaysOnWatchdog) {
+  window._jarvisAlwaysOnWatchdog = setInterval(() => {
+    if (realtimeUserDisabled) return;
+    if (realtimeActive || realtimeConnecting || continuousMode || isRecording) return;
+    // Prefer Realtime (streaming audio); fallback STT only if Realtime fails
+    micBtn.classList.add('recording');
+    setAvatarState('listening');
+    if (voiceRealtimeAvailable) {
+      addTerminalLine('[ambient] 🎙 ativando Realtime', 'system-line');
+      startRealtime().catch(() => _activateContinuousSTT());
+    } else {
+      _activateContinuousSTT();
+    }
+  }, 8000);
+}
+
+function _activateContinuousSTT() {
+  continuousMode = true;
+  micBtn.classList.add('recording');
+  setAvatarState('listening');
+  window._sttCycleSilent = false; // reset so first cycle announces
+  // Stop wake word — it competes with MediaRecorder for the mic and causes audible clicks/beeps
+  try { if (wakeWordRecognition) { wakeWordRecognition.onend = null; wakeWordRecognition.stop(); wakeWordRecognition = null; } } catch {}
+  addTerminalLine('[system] ✅ Modo voz ativo — pode falar', 'system-line');
+  if (!isRecording) startRecording();
+
+  // Auto-upgrade: if Realtime becomes available again, switch back automatically
+  if (window._rtRecoveryInterval) clearInterval(window._rtRecoveryInterval);
+  window._rtRecoveryInterval = setInterval(async () => {
+    if (!continuousMode || realtimeActive || realtimeConnecting || realtimeUserDisabled) return;
+    try {
+      const r = await fetch('/api/health', { signal: AbortSignal.timeout(2000) });
+      const d = await r.json();
+      if (d.capabilities?.voice_realtime) {
+        // Quick probe — try a real Realtime connection
+        const test = new WebSocket(`ws://${location.host}/api/realtime/ws?language=${currentLang}&voice=${getRealtimeVoice()}`);
+        let ok = false;
+        test.onmessage = (e) => { try { if (JSON.parse(e.data).type === 'session.updated') ok = true; } catch {} };
+        await new Promise(r => setTimeout(r, 2500));
+        try { test.close(); } catch {}
+        if (ok && continuousMode && !realtimeActive) {
+          addTerminalLine('[system] ⚡ Realtime disponível — upgrade automático', 'system-line');
+          continuousMode = false;
+          if (isRecording) try { stopRecording(); } catch {}
+          clearInterval(window._rtRecoveryInterval);
+          window._rtRecoveryInterval = null;
+          startRealtime().catch(() => _activateContinuousSTT());
+        }
+      }
+    } catch {}
+  }, 60000); // probe once per minute
+}
 
 // Terminal direct input
 terminal.addEventListener('click', () => chatInput.focus());
@@ -2182,6 +2341,34 @@ initRealtimeBtn();
           announceToRealtime(payload.message);
         } else if (userGestureReceived) {
           speakResponse(payload.message);
+        }
+      }
+
+      // ── PET MIC EVENT — toggle cockpit voice when Zeus pet mic is pressed ──
+      if (payload.type === 'pet-mic') {
+        userGestureReceived = true;
+        if (payload.active) {
+          // Activate cockpit voice the same way clicking the mic button does
+          if (realtimeActive || continuousMode || isRecording) return; // already on
+          addTerminalLine('[pet] 🎤 Ativando voz a partir do Zeus...', 'info-line');
+          micBtn.classList.add('recording');
+          setAvatarState('listening');
+          realtimeUserDisabled = false;
+          if (voiceRealtimeAvailable) {
+            startRealtime().catch(() => _activateContinuousSTT());
+          } else {
+            _activateContinuousSTT();
+          }
+        } else {
+          // Deactivate
+          if (!realtimeActive && !continuousMode && !isRecording) return;
+          addTerminalLine('[pet] 🔇 Desativando voz a partir do Zeus', 'info-line');
+          realtimeUserDisabled = true;
+          if (realtimeActive) stopRealtime();
+          if (continuousMode) continuousMode = false;
+          if (isRecording) { try { stopRecording(); } catch {} }
+          micBtn.classList.remove('recording');
+          setAvatarState('idle');
         }
       }
     } catch {}
@@ -2480,6 +2667,21 @@ initRealtimeBtn();
         } else {
           if (barVoice) barVoice.className = 'bar-fill err';
           if (sVoice) { sVoice.textContent = 'OFF'; sVoice.style.color = '#ff4455'; }
+        }
+
+        // ── Auto-activate Realtime voice (true streaming audio, no chunked recording) ──
+        if (!_autoVoiceStarted && !realtimeActive && !realtimeConnecting && !realtimeUserDisabled) {
+          _autoVoiceStarted = true;
+          userGestureReceived = true;
+          setTimeout(() => {
+            if (realtimeActive || realtimeConnecting || continuousMode || isRecording) return;
+            micBtn.classList.add('recording');
+            if (voiceRealtimeAvailable) {
+              startRealtime().catch(() => { if (voiceOk) _activateContinuousSTT(); });
+            } else if (voiceOk) {
+              _activateContinuousSTT();
+            }
+          }, 1500);
         }
 
         if (data.capabilities?.task_execution) {

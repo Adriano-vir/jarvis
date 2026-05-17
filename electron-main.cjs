@@ -67,6 +67,16 @@ function createWindow() {
 
   mainWindow.loadURL(SERVER_URL);
 
+  // Grant microphone (and camera) permissions — required for getUserMedia in Electron
+  mainWindow.webContents.session.setPermissionRequestHandler((_wc, permission, callback) => {
+    const allowed = ['media', 'microphone', 'audioCapture', 'clipboard-read'];
+    callback(allowed.includes(permission));
+  });
+  mainWindow.webContents.session.setPermissionCheckHandler((_wc, permission) => {
+    const allowed = ['media', 'microphone', 'audioCapture', 'clipboard-read'];
+    return allowed.includes(permission);
+  });
+
   // Open external links in browser, not Electron
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
@@ -146,7 +156,46 @@ app.whenReady().then(async () => {
     resizable: false,
     webPreferences: { nodeIntegration: false }
   });
-  mainWindow.loadURL('data:text/html,<body style="margin:0;background:#000914;display:flex;align-items:center;justify-content:center;height:100vh;font-family:Orbitron,sans-serif"><div style="text-align:center;color:#00d4ff"><div style="font-size:32px;letter-spacing:8px;font-weight:900">J A R V I S</div><div style="margin-top:16px;font-size:11px;letter-spacing:3px;color:#00ff88;animation:pulse 1s infinite">INICIANDO SISTEMAS...</div></div></body>');
+  const splashHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{width:500px;height:300px;overflow:hidden;background:#000914;display:flex;align-items:center;justify-content:center;font-family:'Orbitron','Courier New',monospace}
+    .corner{position:absolute;width:28px;height:28px;border-color:rgba(0,228,255,0.4);border-style:solid}
+    .tl{top:14px;left:14px;border-width:2px 0 0 2px}
+    .tr{top:14px;right:14px;border-width:2px 2px 0 0}
+    .bl{bottom:14px;left:14px;border-width:0 0 2px 2px}
+    .br{bottom:14px;right:14px;border-width:0 2px 2px 0}
+    .center{display:flex;flex-direction:column;align-items:center;gap:14px}
+    .reactor{width:60px;height:60px;border-radius:50%;border:2px solid rgba(0,228,255,0.6);box-shadow:0 0 18px 4px rgba(0,228,255,0.5),0 0 40px 8px rgba(0,228,255,0.2),inset 0 0 18px rgba(0,228,255,0.3);animation:pulse 1.8s ease-in-out infinite}
+    @keyframes pulse{0%,100%{box-shadow:0 0 18px 4px rgba(0,228,255,0.5),0 0 40px 8px rgba(0,228,255,0.2),inset 0 0 18px rgba(0,228,255,0.3)}50%{box-shadow:0 0 28px 8px rgba(0,228,255,0.8),0 0 60px 14px rgba(0,228,255,0.35),inset 0 0 28px rgba(0,228,255,0.5)}}
+    .title{color:#ffd700;font-size:28px;letter-spacing:10px;font-weight:900;text-shadow:0 0 12px rgba(255,215,0,0.6)}
+    .rule-wrap{width:260px;height:1px;background:rgba(0,228,255,0.15);overflow:hidden}
+    .rule{height:1px;background:linear-gradient(90deg,transparent,#00e4ff,transparent);width:0;animation:grow 1.2s ease-out 0.3s forwards}
+    @keyframes grow{to{width:100%}}
+    .boot{display:flex;flex-direction:column;gap:4px;font-family:'JetBrains Mono','Courier New',monospace;font-size:10px;color:#00e4ff;letter-spacing:1px}
+    .line{opacity:0;animation:fadein 0.4s ease forwards}
+    .l1{animation-delay:0.6s}
+    .l2{animation-delay:1.1s}
+    .l3{animation-delay:1.6s}
+    .l4{animation-delay:2.1s}
+    @keyframes fadein{to{opacity:1}}
+  </style></head><body>
+    <div class="corner tl"></div>
+    <div class="corner tr"></div>
+    <div class="corner bl"></div>
+    <div class="corner br"></div>
+    <div class="center">
+      <div class="reactor"></div>
+      <div class="title">J.A.R.V.I.S.</div>
+      <div class="rule-wrap"><div class="rule"></div></div>
+      <div class="boot">
+        <div class="line l1">NEURAL CORE ........... ONLINE</div>
+        <div class="line l2">AUDIO SYSTEMS .......... OK</div>
+        <div class="line l3">VOICE MODULE ......... READY</div>
+        <div class="line l4">ALL SYSTEMS NOMINAL</div>
+      </div>
+    </div>
+  </body></html>`;
+  mainWindow.loadURL('data:text/html,' + encodeURIComponent(splashHtml));
 
   try {
     await waitForServer(40);
