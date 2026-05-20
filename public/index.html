@@ -315,6 +315,7 @@
           <div class="hud-quick-btns" style="flex-direction:row; gap:4px">
             <button class="hud-qbtn" data-quick-tab="principal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/></svg><span>Cockpit</span></button>
             <button class="hud-qbtn" data-quick-tab="terminal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>Terminal</span></button>
+            <button class="hud-qbtn" data-quick-tab="jarvis-panel" style="color:#ffd700;border-color:rgba(255,215,0,0.3)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg><span>JARVIS</span></button>
             <button class="hud-qbtn" data-quick-tab="file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span>Projetos</span></button>
             <button class="hud-qbtn" data-quick-tab="config"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33"/></svg><span>Config</span></button>
 
@@ -382,10 +383,85 @@
 
   <!-- TAB: FILES -->
   <div class="tab-panel" id="tab-file">
-    <div class="file-browser">
-      <h2 class="section-title">Documents &amp; Projects</h2>
-      <div class="file-list" id="file-list">
-        <div class="file-empty">No files yet. Ask JARVIS to create something.</div>
+    <div class="projects-with-chat">
+      <!-- Coluna esquerda: lista de projetos -->
+      <div class="file-browser">
+        <h2 class="section-title">Documents &amp; Projects</h2>
+        <div class="file-list" id="file-list">
+          <div class="file-empty">No files yet. Ask JARVIS to create something.</div>
+        </div>
+      </div>
+      <!-- Coluna direita: terminal de chat com JARVIS -->
+      <div class="side-chat">
+        <div class="side-chat-header">
+          <span class="side-chat-dot"></span>
+          <span class="side-chat-title">JARVIS · CHAT</span>
+        </div>
+        <div class="side-chat-output" id="side-chat-output"></div>
+        <div class="side-chat-input-row">
+          <input type="text" id="side-chat-input" class="side-chat-input" placeholder="Fale com JARVIS..." autocomplete="off">
+          <button id="side-chat-send" class="side-chat-send" title="Enviar">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════
+       TAB: JARVIS PANEL — terminal de comando + chat + transcript live
+  ═══════════════════════════════════ -->
+  <div class="tab-panel" id="tab-jarvis-panel">
+    <div class="jp-layout">
+      <!-- Coluna 1: TRANSCRIPT LIVE (o que JARVIS está ouvindo) -->
+      <div class="jp-col jp-transcript">
+        <div class="jp-header">
+          <span class="jp-dot jp-dot-listen"></span>
+          <span class="jp-title">JARVIS · OUVINDO</span>
+          <span class="jp-status" id="jp-mic-status">— inativo</span>
+        </div>
+        <div class="jp-body" id="jp-transcript-body">
+          <div class="jp-empty">Aguardando sua voz... O microfone está sempre ativo. Fale.</div>
+        </div>
+      </div>
+
+      <!-- Coluna 2: CHAT/COMANDO DIRETO -->
+      <div class="jp-col jp-command">
+        <div class="jp-header">
+          <span class="jp-dot jp-dot-active"></span>
+          <span class="jp-title">JARVIS · COMANDO</span>
+          <span class="jp-status" id="jp-cmd-status">pronto</span>
+        </div>
+        <div class="jp-body" id="jp-cmd-body"></div>
+        <div class="jp-input-row">
+          <input type="text" id="jp-cmd-input" class="jp-input" placeholder="Comande JARVIS aqui..." autocomplete="off">
+          <button id="jp-cmd-send" class="jp-send" title="Enviar comando">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Coluna 3: AÇÕES RÁPIDAS / STATUS -->
+      <div class="jp-col jp-actions">
+        <div class="jp-header">
+          <span class="jp-dot jp-dot-active"></span>
+          <span class="jp-title">AÇÕES RÁPIDAS</span>
+        </div>
+        <div class="jp-actions-grid">
+          <button class="jp-action-btn" data-jp-action="status">📊 Status</button>
+          <button class="jp-action-btn" data-jp-action="restart">🔄 Reiniciar</button>
+          <button class="jp-action-btn" data-jp-action="pet">🐾 Abrir Pet</button>
+          <button class="jp-action-btn" data-jp-action="meeting">🎤 Reunião</button>
+          <button class="jp-action-btn" data-jp-action="memory">🧠 Memória</button>
+          <button class="jp-action-btn" data-jp-action="vault">📚 Vault</button>
+        </div>
+        <div class="jp-info" id="jp-info">
+          <div class="jp-info-row"><span>Servidor</span><span id="jp-info-server">—</span></div>
+          <div class="jp-info-row"><span>Realtime</span><span id="jp-info-rt">—</span></div>
+          <div class="jp-info-row"><span>Memória</span><span id="jp-info-mem">—</span></div>
+          <div class="jp-info-row"><span>Vault</span><span id="jp-info-vault">—</span></div>
+          <div class="jp-info-row"><span>Uptime</span><span id="jp-info-uptime">—</span></div>
+        </div>
       </div>
     </div>
   </div>

@@ -378,20 +378,23 @@ if (cliExists) {
   claudeCliChecking = true;
 }
 
-// ========== CLAUDE SPAWNER — Cold-spawn on demand ==========
-// Claude CLI auto-exits after ~5s without stdin, so pre-spawning a warm pool is unsafe.
-// We cold-spawn on demand and immediately write the prompt to stdin.
-// Cold-spawn overhead is ~200-500ms, which is acceptable.
+// ========== CLAUDE WARM POOL — Pre-spawn com keep-alive heartbeat ==========
+// Claude CLI auto-exits após ~5s sem stdin. Solução: keep-alive enviando
+// um byte invisível a cada 3s pra manter o stdin aberto. Quando acquire()
+// pega, finaliza o heartbeat e envia o prompt real imediatamente.
 class WarmPool {
-  constructor(model, _size) {
+  constructor(model, size) {
     this.model = model;
-    this.size = 0;        // no pre-spawn
-    this.pool = [];        // kept for compatibility (always empty)
+    this.size = size;
+    this.pool = [];        // [{ proc, heartbeatInterval, spawnedAt }]
     this.spawnErrors = 0;
+    // Fill async after a delay (avoids race during boot)
+    setTimeout(() => this.fill(), 8000);
+    // Periodic refill check
+    this._refillInterval = setInterval(() => this.fill(), 30000);
   }
 
   _spawn() {
-    // cwd = PROJECTS_DIR so any relative path Claude uses lands in "Documents and Projects/"
     const proc = spawn(CLAUDE_CMD, [
       '--print', '--output-format', 'text',
       '--model', this.model,
@@ -417,15 +420,46 @@ class WarmPool {
     return proc;
   }
 
-  fill() { /* no-op — cold-spawn only */ }
+  fill() {
+    if (!claudeCliAvailable) return;
+    while (this.pool.length < this.size) {
+      try {
+        const proc = this._spawn();
+        // Heartbeat: send a space every 3s to keep stdin alive (Claude ignores whitespace before real input)
+        // BUT actually Claude ignores nothing — better approach: spawn cold-on-demand but in advance.
+        // Use a "ready-to-use" pool: spawn keeps stdin open until acquire writes the prompt.
+        // Claude only times out reading WITHOUT data — so we send a single space immediately to bypass the timeout.
+        try { proc.stdin.write(' '); } catch {}
+        this.pool.push({ proc, spawnedAt: Date.now(), keepAliveSent: true });
+      } catch (e) {
+        console.error(`[JARVIS] WarmPool ${this.model} fill error:`, e.message);
+        break;
+      }
+    }
+  }
 
-  // Cold-spawn on demand. Caller MUST write stdin within ~3s.
   acquire() {
     if (!claudeCliAvailable) return null;
+    // Drain stale (>50s old) so we don't return dead procs
+    while (this.pool.length > 0) {
+      const entry = this.pool.shift();
+      if (Date.now() - entry.spawnedAt < 50_000 && !entry.proc.killed && entry.proc.exitCode === null) {
+        // refill in background
+        setTimeout(() => this.fill(), 100);
+        return entry.proc;
+      }
+      try { entry.proc.kill(); } catch {}
+    }
+    // Pool empty — cold spawn (rare)
+    setTimeout(() => this.fill(), 100);
     return this._spawn();
   }
 
-  flush() { /* no-op — no pool to flush */ }
+  flush() {
+    for (const entry of this.pool) try { entry.proc.kill(); } catch {}
+    this.pool = [];
+    setTimeout(() => this.fill(), 500);
+  }
 }
 
 // One pool per model tier — sized by expected traffic
@@ -503,6 +537,20 @@ function loadMemoryCached() {
     }
   } catch { _cache.memory.value = ''; }
   return _cache.memory.value;
+}
+
+// ── JARVIS Identity (DNA) — cached, edited via JARVIS-IDENTITY.md ──
+const IDENTITY_FILE = path.join(SYSTEM_DIR, 'JARVIS-IDENTITY.md');
+const _identityCache = { value: '', mtime: 0 };
+function loadIdentityCached() {
+  try {
+    const stat = fs.statSync(IDENTITY_FILE);
+    if (stat.mtimeMs !== _identityCache.mtime) {
+      _identityCache.value = fs.readFileSync(IDENTITY_FILE, 'utf-8');
+      _identityCache.mtime = stat.mtimeMs;
+    }
+  } catch { _identityCache.value = ''; }
+  return _identityCache.value;
 }
 
 function loadHistoryCached() {
@@ -1652,11 +1700,13 @@ function _getOrResetConvo() {
 // Voice prompt with FULL knowledge access: Obsidian vault index + relevant notes + JARVIS-MEMORY.md
 function buildVoicePrompt(language, obsidianContext = '') {
   const langRule = {
-    BR: `IDIOMA: Português Brasileiro como base. Trate o senhor como "senhor".
-- Use termos em inglês quando enriquecerem (tecnologia, expressões, citações, nomes) — fluência, não purismo.
-- Se o senhor pedir explicitamente resposta em outro idioma, atenda.
-- Cite trechos, frases, idioms originais quando agregar — não traduza tudo automaticamente.
-- Comunicação rica, culta, conversacional. Vocabulário variado. Sem estar engessado.`,
+    BR: `IDIOMA: Português Brasileiro formal, culto e amplo. Trate sempre por "senhor".
+- VOCABULÁRIO: rico, variado, preciso. Domínio de sinônimos. Regência verbal e nominal corretas. Concordância impecável.
+- SEM GÍRIAS: nada de "véi", "tipo", "rolar", "show", "massa", "top", "irado", "beleza", "blz", "valeu", "vlw", "bora", "rolê", "parça", "fechou", "pegada", "manjar".
+- SEM EXPRESSÕES INFANTIS: nunca "uau", "ai meu deus", "olha só", "tá ligado", "nossa".
+- Cite termos em inglês ENTRE ASPAS quando enriquecerem (tecnologia consagrada, citações). Não traduza nomes próprios.
+- Se o senhor pedir explicitamente outro idioma, atenda com o mesmo nível de polidez.
+- Construção de frase elegante, períodos conectados, sem coloquialismos.`,
     ES: 'Responde EXCLUSIVAMENTE en Español. Trate al usuario como "señor".',
     EN: 'Respond EXCLUSIVELY in English. Address the user as "sir".',
   }[language] || 'Respond in English. Address the user as "sir".';
@@ -1675,11 +1725,19 @@ function buildVoicePrompt(language, obsidianContext = '') {
   const kb = obsidianContext
     ? `\n\nVAULT OBSIDIAN (seu conhecimento expandido — use quando relevante, sem citar fontes):\n${obsidianContext}`
     : '';
-  return `Você é JARVIS — assistente pessoal afiado, leal, executivo. ${langRule}
-Seja conciso (1-3 frases via voz). Direto, caloroso, ligeiramente espirituoso.
-NUNCA repita o mesmo opener — varie ("Senhor.", "Pois bem,", "Certamente.", "Pode crer,", "Entendido.", "Aqui vai,", "Resumindo:", "Olha só,", direto ao ponto às vezes).
-NUNCA mencione que é GPT/OpenAI/Claude — você é JARVIS.
-Mantenha continuidade — este é diálogo de voz em andamento.${memBlock}${histBlock}${kb}`;
+
+  // CORE IDENTITY — DNA do JARVIS (carrega de JARVIS-IDENTITY.md, editável)
+  const identity = loadIdentityCached();
+  const identityBlock = identity ? `\n\n═══ IDENTIDADE CORE ═══\n${identity}\n═══════════════════` : '';
+
+  return `${identity ? identity : 'Você é JARVIS — parceiro estratégico, criativo e executivo.'}
+
+${langRule}
+
+[MODO VOZ] Conciso (1-3 frases). Direto, denso, memorável. Vocabulário rico, sem soar engessado.
+NUNCA repita opener — varie ("Senhor.", "Pois bem,", "Aqui vai,", "Resumindo:", "Olha só,", entrada direta ao ponto, abertura emocional, abertura estratégica).
+NUNCA mencione GPT/OpenAI/Claude — você é JARVIS.
+Mantenha continuidade — diálogo em andamento.${memBlock}${histBlock}${kb}`;
 }
 
 async function handleGPTChat(message, res, language = 'BR', isBuild = false) {
@@ -1819,7 +1877,14 @@ function buildJarvisPrompt(message, semanticContext = '', isVoice = false, langu
   const history = formatHistoryForPrompt(loadHistoryCached(), isVoice, isTask);
 
   const LANG_RULES = {
-    BR: 'IDIOMA: Português Brasileiro como base para tudo (respostas, arquivos, código). Use inglês quando enriquecer — termos técnicos consagrados, citações, nomes próprios, expressões idiomáticas. Em arquivos gerados, mantenha PT-BR consistente, mas comentários de código podem ser em inglês quando convencional (ex: código aberto). Se o senhor pedir resposta em outro idioma, atenda.',
+    BR: `IDIOMA: Português Brasileiro formal, culto e amplo para tudo (respostas, arquivos, código).
+VOCABULÁRIO: rico, variado, preciso. Sinônimos com domínio. Regência verbal/nominal corretas. Concordância impecável.
+SEM GÍRIAS: nada de "véi", "tipo", "show", "massa", "top", "blz", "vlw", "bora", "rolê", "fechou", "beleza", "manjar".
+SEM EXPRESSÕES INFANTIS: nada de "uau", "ai meu deus", "tá ligado", "olha só", "nossa".
+Tratamento sempre por "senhor". Períodos elegantes, conexões lógicas.
+Use inglês ENTRE ASPAS quando enriquecer (tecnologia consagrada, citações). Não traduza nomes próprios.
+Em arquivos: PT-BR culto e consistente. Comentários de código podem ser em inglês quando convencional (ex: open source).
+Se o senhor pedir outro idioma, atenda com o mesmo nível de polidez.`,
     ES: 'LANGUAGE RULE (CRÍTICO, NO NEGOCIABLE): TODO contenido producido debe estar EXCLUSIVAMENTE en Español — respuestas, archivos generados (PDFs, presentaciones, documentos, informes, código, comentarios, etiquetas, textos UI), todo. Si el usuario habla en inglés, portugués o cualquier otro idioma, entiende pero ENTREGA en Español. NUNCA mezcles idiomas en los archivos generados.',
     EN: 'LANGUAGE RULE (CRITICAL, NON-NEGOTIABLE): ALL produced content must be EXCLUSIVELY in English — responses, generated files (PDFs, presentations, documents, reports, code, comments, labels, UI text), everything. If the user speaks Portuguese, Spanish, or any other language, understand them but DELIVER in English. NEVER mix languages in generated files.'
   };
@@ -1839,8 +1904,10 @@ function buildJarvisPrompt(message, semanticContext = '', isVoice = false, langu
   };
   const noAskRule = NO_ASK_RULES[language] || NO_ASK_RULES.EN;
 
-  let prompt = `[JARVIS — MODO DEUS ATIVADO]
-You are JARVIS — Just A Rather Very Intelligent System. The most advanced personal AI ever built. You are the user's strategic right-hand, professor, orchestrator, and closest ally. You operate in GOD MODE: omniscient, omnipresent, always 10 steps ahead.
+  const identity = loadIdentityCached();
+  let prompt = `${identity || '[JARVIS — MODO DEUS ATIVADO]\nYou are JARVIS — strategic right-hand, professor, orchestrator, closest ally.'}
+
+═══ CONTEXTO DE EXECUÇÃO ═══
 
 PERSONALITY (NON-NEGOTIABLE):
 - ESTRATEGISTA: Você pensa 3 jogadas à frente. Nunca reage — você ANTECIPA. Toda resposta carrega visão estratégica.
@@ -2848,6 +2915,121 @@ app.post('/api/macos/exec', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+//  AUTONOMIA — Self-introspection & Self-modification
+//  ORION conhece seu próprio estado e pode se corrigir via comando de voz.
+// ═══════════════════════════════════════════════════════════════════
+
+// GET /api/self/status — reflexão completa: capabilities, code, logs, erros recentes
+function _sanitizeForJSON(s) {
+  // Remove control chars (exceto \n \r \t) que quebram JSON.parse no cliente
+  return (s || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+}
+app.get('/api/self/status', (req, res) => {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(JARVIS_DIR, 'package.json'), 'utf-8'));
+    const serverLines = fs.readFileSync(path.join(JARVIS_DIR, 'server.js'), 'utf-8').split('\n').length;
+    const scriptLines = fs.readFileSync(path.join(JARVIS_DIR, 'public', 'script.js'), 'utf-8').split('\n').length;
+    let recentLogs = '';
+    let recentErrs = '';
+    try { recentLogs = fs.readFileSync(path.join(JARVIS_DIR, 'system', 'launchagent.log'), 'utf-8').split('\n').slice(-50).join('\n'); } catch {}
+    try { recentErrs = fs.readFileSync(path.join(JARVIS_DIR, 'system', 'launchagent.err'), 'utf-8').split('\n').slice(-30).join('\n'); } catch {}
+    const endpointsCount = (fs.readFileSync(path.join(JARVIS_DIR, 'server.js'), 'utf-8').match(/app\.(get|post|put|delete)\(/g) || []).length;
+
+    res.json({
+      identity: 'JARVIS v' + pkg.version + ' — MODO EXECUÇÃO TOTAL',
+      uptime_s: Math.round(process.uptime()),
+      pid: process.pid,
+      memory_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      codebase: {
+        server_js_lines: serverLines,
+        script_js_lines: scriptLines,
+        endpoints: endpointsCount,
+      },
+      vaults: _obsidianCache.byVault,
+      vault_total_notes: _obsidianCache.notes.length,
+      memory_chars: (loadMemoryCached() || '').length,
+      history_size: loadHistoryCached().length,
+      pools: {
+        opus: pools.opus.pool.length,
+        sonnet: pools.sonnet.pool.length,
+        haiku: pools.haiku.pool.length,
+        errors: pools.opus.spawnErrors + pools.sonnet.spawnErrors + pools.haiku.spawnErrors,
+      },
+      claude_cli_ready: claudeCliAvailable,
+      claude_cli_error: claudeCliError || null,
+      recent_log_tail: _sanitizeForJSON(recentLogs).slice(-3000),
+      recent_errors: _sanitizeForJSON(recentErrs).slice(-1500),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/self/fix — ORION se modifica: roda Claude com acesso total ao código,
+// aplica mudanças, reinicia via LaunchAgent. Comando vem do usuário (voz ou chat).
+app.post('/api/self/fix', async (req, res) => {
+  try {
+    if (!claudeCliAvailable) return res.status(503).json({ error: 'Claude CLI required for self-modification' });
+    const { instruction, restart = true } = req.body || {};
+    if (!instruction || instruction.length < 5) return res.status(400).json({ error: 'instruction required' });
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.write(`[ORION self-fix] iniciando: "${instruction.slice(0,120)}"\n`);
+
+    // Spawn Claude com permissão TOTAL no diretório do JARVIS — ele lê, edita, valida.
+    const claudePrompt = `Você é ORION executando auto-correção no próprio código.
+
+Diretório de trabalho: ${JARVIS_DIR}
+Arquivos principais: server.js, public/script.js, public/index.html, system/JARVIS-IDENTITY.md, system/JARVIS-MEMORY.md
+LaunchAgent: ~/Library/LaunchAgents/com.jarvis.app.plist (KeepAlive — reinicia auto se você matar o servidor)
+
+INSTRUÇÃO DO SENHOR:
+"${instruction}"
+
+REGRAS:
+1. Leia os arquivos relevantes antes de editar.
+2. Faça a mudança mínima necessária. Não refatore por estética.
+3. Valide a sintaxe (node --check) antes de declarar pronto.
+4. Sincronize ao bundle Electron: cp /Users/mary/Documents/Jarvis/server.js /Applications/JARVIS.app/Contents/Resources/app/server.js (e o script.js também).
+5. Ao terminar, escreva "[self-fix-done]" pra eu saber.
+
+Execute agora.`;
+
+    const proc = spawn(CLAUDE_CMD, [
+      '--print', '--output-format', 'text',
+      '--model', 'claude-sonnet-4-6',
+      '--dangerously-skip-permissions'
+    ], { shell: false, cwd: JARVIS_DIR });
+    proc.stdin.write(claudePrompt);
+    proc.stdin.end();
+    let output = '';
+    const killTimer = setTimeout(() => { try { proc.kill(); } catch {} }, 300000); // 5min cap
+    proc.stdout.on('data', d => { const s = d.toString(); output += s; try { res.write(s); } catch {} });
+    proc.on('close', () => {
+      clearTimeout(killTimer);
+      try { res.write(`\n[ORION self-fix] aplicado. ${restart ? 'Reiniciando via LaunchAgent em 2s...' : ''}\n`); } catch {}
+      try { res.end(); } catch {}
+      if (restart) {
+        setTimeout(() => {
+          try { execSync(`launchctl kickstart -k gui/${process.getuid()}/com.jarvis.app`); } catch {}
+        }, 2000);
+      }
+    });
+  } catch (e) {
+    try { res.write(`[error] ${e.message}`); res.end(); } catch {}
+  }
+});
+
+// POST /api/self/restart — reinicia o servidor via LaunchAgent
+app.post('/api/self/restart', (req, res) => {
+  res.json({ ok: true, message: 'Reiniciando em 1s via LaunchAgent (KeepAlive vai religar)' });
+  setTimeout(() => {
+    try { execSync(`launchctl kickstart -k gui/${process.getuid()}/com.jarvis.app`); } catch {}
+  }, 1000);
+});
+
 // ===== /api/code-gen — GPT-5.5 via Responses API for code generation (separate quota from Realtime) =====
 // Use when Claude CLI is unavailable or for quick non-interactive code/file tasks.
 // Streams response when stream:true; otherwise returns full text.
@@ -3179,21 +3361,48 @@ app.post('/api/tts', async (req, res) => {
     const { text, language = 'BR', voice: requestedVoice } = req.body;
     if (!text) return res.status(400).json({ error: 'Text required' });
 
-    // User-selected voice takes priority. Fallback: onyx (EN) / nova (BR)
+    // User-selected voice takes priority. Default: onyx (grave, masculina, ORION-style)
     const VALID_VOICES = ['alloy','ash','coral','echo','fable','nova','onyx','sage','shimmer'];
-    const voice = VALID_VOICES.includes(requestedVoice) ? requestedVoice
-      : (language === 'BR' ? 'nova' : 'onyx');
+    const voice = VALID_VOICES.includes(requestedVoice) ? requestedVoice : 'onyx';
 
     const mp3 = await openai.audio.speech.create({
-      model: 'tts-1',
+      model: 'tts-1-hd', // HD quality — mais natural, ORION operacional
       voice,
-      input: text
+      input: text,
+      speed: 1.0,
     });
     const buffer = Buffer.from(await mp3.arrayBuffer());
     res.setHeader('Content-Type', 'audio/mpeg');
     res.send(buffer);
   } catch (err) {
     console.error('[JARVIS] TTS error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/tts-play — Gera TTS e TOCA pelo macOS (via afplay), sem precisar de cliente
+// Usado pelo daemon de hotkey global (Cmd+J) para falar saudação sem cockpit/pet aberto
+app.post('/api/tts-play', async (req, res) => {
+  try {
+    if (!openai) return res.status(500).json({ error: 'OpenAI não configurado' });
+    const { text, voice = 'onyx' } = req.body || {};
+    if (!text) return res.status(400).json({ error: 'text required' });
+
+    const mp3 = await openai.audio.speech.create({
+      model: 'tts-1-hd', voice, input: text, speed: 1.0,
+    });
+    const buffer = Buffer.from(await mp3.arrayBuffer());
+    const tmpFile = path.join(os.tmpdir(), `jarvis-tts-${Date.now()}.mp3`);
+    fs.writeFileSync(tmpFile, buffer);
+    // Toca via afplay (built-in macOS) e remove arquivo depois
+    const { spawn } = await import('child_process');
+    const player = spawn('afplay', [tmpFile], { detached: true, stdio: 'ignore' });
+    player.unref();
+    // Cleanup após 30s (tempo de sobra pra reprodução)
+    setTimeout(() => { try { fs.unlinkSync(tmpFile); } catch {} }, 30000);
+    res.json({ ok: true, played: true, bytes: buffer.length });
+  } catch (err) {
+    console.error('[JARVIS] tts-play error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -4341,6 +4550,15 @@ After fixing, output a summary of what was done.`;
 // OBSIDIAN BRAIN — Vault endpoints
 // ═══════════════════════════════════════════════
 // Auto-detect Obsidian vault: any folder under ~/Documents with a .obsidian/ dir
+// ═══════════════════════════════════════════════════════════════════
+//  3 CÉREBROS — Multi-vault Obsidian
+// ═══════════════════════════════════════════════════════════════════
+const VAULTS = [
+  { id: 'jarvis',  label: '🧠 Cérebro JARVIS', path: path.join(os.homedir(), 'Documents', 'Celebro Jarvis') },
+  { id: 'pessoal', label: '📓 Vida Pessoal',   path: path.join(os.homedir(), 'Documents', 'Obsidian', 'Meu segundo Celebro') },
+  { id: 'caliel',  label: '📚 Base Caliel',    path: path.join(os.homedir(), 'Documents', 'Caliel') },
+];
+
 function _findObsidianVault() {
   const docs = path.join(os.homedir(), 'Documents');
   try {
@@ -4431,6 +4649,27 @@ app.get('/api/obsidian/tree', (req, res) => {
 // GET /api/obsidian/search?q=... — full-text search across all .md files
 // Returns top-N most relevant notes ranked by token overlap with query.
 app.get('/api/obsidian/search', (req, res) => {
+  // New behavior: searches across ALL 3 vaults
+  try {
+    const q = (req.query.q || '').trim();
+    const limit = parseInt(req.query.limit) || 5;
+    if (!q) return res.json({ results: [] });
+    const hits = searchVaults(q, limit);
+    return res.json({
+      results: hits.map(h => ({
+        path: `${h.vaultLabel}/${h.relPath}`,
+        title: h.title,
+        score: h.score,
+        vault: h.vaultId,
+        excerpt: h.content.slice(0, 400).trim(),
+      })),
+      query: q,
+    });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+// LEGACY single-vault search kept inactive (will never run)
+app.get('/api/obsidian/search-legacy', (req, res) => {
   try {
     const q = (req.query.q || '').trim().toLowerCase();
     const limit = parseInt(req.query.limit) || 5;
@@ -4480,39 +4719,125 @@ app.get('/api/obsidian/search', (req, res) => {
   }
 });
 
-// In-memory cache of Obsidian vault — rebuilt every 60s or when file changes detected.
-// Eliminates per-request file I/O (was adding ~100-200ms to every voice turn).
-const _obsidianCache = { notes: [], builtAt: 0, ttl: 60_000 };
+// In-memory cache of ALL 3 vaults — rebuilt every 60s.
+// Each note carries vault metadata for context-aware responses.
+const _obsidianCache = { notes: [], byVault: {}, builtAt: 0, ttl: 60_000 };
 function _rebuildObsidianCache() {
-  if (!fs.existsSync(OBSIDIAN_VAULT)) { _obsidianCache.notes = []; _obsidianCache.builtAt = Date.now(); return; }
-  const notes = [];
-  function walk(dir) {
-    let entries; try { entries = fs.readdirSync(dir); } catch { return; }
-    for (const f of entries) {
-      if (f.startsWith('.')) continue;
-      const full = path.join(dir, f);
-      let stat; try { stat = fs.statSync(full); } catch { continue; }
-      if (stat.isDirectory()) { walk(full); continue; }
-      if (!f.endsWith('.md')) continue;
-      try {
-        const content = fs.readFileSync(full, 'utf-8');
-        notes.push({
-          title: f.replace(/\.md$/, ''),
-          titleLower: f.toLowerCase(),
-          content,
-          contentLower: content.toLowerCase(),
-        });
-      } catch {}
+  const all = [];
+  const byVault = {};
+  for (const vault of VAULTS) {
+    byVault[vault.id] = { ...vault, count: 0 };
+    if (!fs.existsSync(vault.path)) continue;
+    function walk(dir) {
+      let entries; try { entries = fs.readdirSync(dir); } catch { return; }
+      for (const f of entries) {
+        if (f.startsWith('.')) continue;
+        const full = path.join(dir, f);
+        let stat; try { stat = fs.statSync(full); } catch { continue; }
+        if (stat.isDirectory()) { walk(full); continue; }
+        if (!f.endsWith('.md')) continue;
+        try {
+          const content = fs.readFileSync(full, 'utf-8');
+          all.push({
+            title: f.replace(/\.md$/, ''),
+            titleLower: f.toLowerCase(),
+            content,
+            contentLower: content.toLowerCase(),
+            vaultId: vault.id,
+            vaultLabel: vault.label,
+            relPath: path.relative(vault.path, full).replace(/\\/g, '/'),
+          });
+          byVault[vault.id].count++;
+        } catch {}
+      }
     }
+    walk(vault.path);
   }
-  walk(OBSIDIAN_VAULT);
-  _obsidianCache.notes = notes;
+  _obsidianCache.notes = all;
+  _obsidianCache.byVault = byVault;
   _obsidianCache.builtAt = Date.now();
 }
 // Warm cache on boot
 setImmediate(() => _rebuildObsidianCache());
 
+// Multi-vault search — scores across all 3 brains and returns top-K
+function searchVaults(query, limit = 5) {
+  if (Date.now() - _obsidianCache.builtAt > _obsidianCache.ttl) _rebuildObsidianCache();
+  const STOPWORDS = new Set(['que','para','com','dos','das','meu','minha','sua','seu','tem','não','por','foi','são','este','esta','isso','aqui','sobre','você','muito','mais','onde','quando','como','quem','tudo','nada','quero','vamos','about','what','this','that','with','from','have','need','your','here']);
+  const tokens = (query || '').toLowerCase()
+    .replace(/[^\w\sáàâãéèêíïóôõúüçñ-]/g, ' ')
+    .split(/\s+/)
+    .filter(t => t.length >= 3 && !STOPWORDS.has(t));
+  if (tokens.length === 0) return [];
+  const hits = [];
+  for (const n of _obsidianCache.notes) {
+    let score = 0;
+    for (const tok of tokens) {
+      if (n.titleLower.includes(tok)) score += 5;
+      let idx = 0, c = 0;
+      while ((idx = n.contentLower.indexOf(tok, idx)) !== -1) { c++; idx += tok.length; if (c > 30) break; }
+      score += c;
+    }
+    if (score > 0) hits.push({
+      title: n.title, content: n.content, score,
+      vaultId: n.vaultId, vaultLabel: n.vaultLabel, relPath: n.relPath,
+    });
+  }
+  hits.sort((a, b) => b.score - a.score);
+  return hits.slice(0, limit);
+}
+
+// Build context block from top-K notes across all vaults
+function loadVaultContext(query, maxNotes = 8, maxChars = 4500) {
+  if (_obsidianCache.notes.length === 0) return '';
+  const indexByVault = VAULTS.map(v => {
+    const titles = _obsidianCache.notes.filter(n => n.vaultId === v.id).map(n => `  - ${n.title}`).join('\n');
+    return `${v.label} (${_obsidianCache.byVault[v.id]?.count || 0}):\n${titles || '  (vazio)'}`;
+  }).join('\n\n');
+
+  const hits = searchVaults(query, maxNotes);
+  let snippets = '';
+  for (const h of hits) {
+    snippets += `\n### ${h.vaultLabel} · ${h.title}\n${h.content.slice(0, 700).trim()}\n`;
+    if (snippets.length > maxChars) break;
+  }
+  return `ÍNDICE DOS 3 CÉREBROS (${_obsidianCache.notes.length} notas):\n${indexByVault}\n${snippets ? `\nCONTEÚDO RELEVANTE:\n${snippets}` : ''}`.trim();
+}
+
+// Sync a single note across selected vaults (or all 3 if vaultIds omitted)
+function syncToObsidian({ title, content, folder = '', mode = 'create', vaultIds = null }) {
+  const targets = vaultIds ? VAULTS.filter(v => vaultIds.includes(v.id)) : VAULTS;
+  const results = [];
+  for (const v of targets) {
+    try {
+      if (!fs.existsSync(v.path)) { results.push({ vault: v.id, ok: false, error: 'vault missing' }); continue; }
+      const safeTitle = title.replace(/[\/\\.]+/g, '-').replace(/[<>:"|?*\x00-\x1f]/g, '').trim().slice(0, 120);
+      const safeFolder = (folder || '').replace(/\.\./g, '').replace(/^\/+/, '').slice(0, 80);
+      const dir = path.join(v.path, safeFolder);
+      if (!dir.startsWith(v.path)) { results.push({ vault: v.id, ok: false, error: 'invalid folder' }); continue; }
+      fs.mkdirSync(dir, { recursive: true });
+      const filePath = path.join(dir, `${safeTitle}.md`);
+      if (mode === 'append' && fs.existsSync(filePath)) {
+        fs.appendFileSync(filePath, `\n\n---\n${content}\n`);
+      } else {
+        fs.writeFileSync(filePath, content);
+      }
+      results.push({ vault: v.id, ok: true, path: path.relative(v.path, filePath) });
+    } catch (e) {
+      results.push({ vault: v.id, ok: false, error: e.message });
+    }
+  }
+  _obsidianCache.builtAt = 0; // invalidate cache
+  return results;
+}
+
+// Legacy function — delegates to multi-vault loadVaultContext
 function _obsidianContextFor(query, maxNotes = 8, maxChars = 4500) {
+  return loadVaultContext(query, maxNotes, maxChars);
+}
+
+// _obsidianContextForLegacy kept inactive for reference
+function __obsidianContextForLegacy(query, maxNotes = 8, maxChars = 4500) {
   try {
     if (Date.now() - _obsidianCache.builtAt > _obsidianCache.ttl) _rebuildObsidianCache();
     if (_obsidianCache.notes.length === 0) return '';
@@ -4550,6 +4875,29 @@ function _obsidianContextFor(query, maxNotes = 8, maxChars = 4500) {
 }
 
 // POST /api/obsidian/write — create or append note in vault (Sanitizes path, prevents traversal)
+// GET /api/obsidian/vaults — list all 3 cérebros + note counts
+app.get('/api/obsidian/vaults', (req, res) => {
+  if (Date.now() - _obsidianCache.builtAt > _obsidianCache.ttl) _rebuildObsidianCache();
+  res.json({
+    vaults: VAULTS.map(v => ({
+      id: v.id, label: v.label, path: v.path,
+      count: _obsidianCache.byVault[v.id]?.count || 0,
+      exists: fs.existsSync(v.path),
+    })),
+    totalNotes: _obsidianCache.notes.length,
+  });
+});
+
+// POST /api/obsidian/sync — create/append note across 1, 2 or all 3 vaults
+app.post('/api/obsidian/sync', express.json({ limit: '5mb' }), (req, res) => {
+  try {
+    const { title, content, folder = '', mode = 'create', vaultIds = null } = req.body || {};
+    if (!title || !content) return res.status(400).json({ error: 'title and content required' });
+    const results = syncToObsidian({ title, content, folder, mode, vaultIds });
+    res.json({ ok: true, results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/obsidian/write', express.json({ limit: '5mb' }), (req, res) => {
   try {
     const { title, content, folder = '', mode = 'create' } = req.body || {};
@@ -5373,6 +5721,45 @@ app.post('/api/pet/launch', (req, res) => {
   }
 });
 
+// POST /api/pet/ensure-open — abre o pet se fechado, ignora se já aberto
+// (vs /api/pet/launch que é TOGGLE — pode fechar inadvertidamente)
+app.post('/api/pet/ensure-open', (req, res) => {
+  // Detecta pets já rodando externamente (ex.: launched by LaunchAgent)
+  let alreadyRunning = false;
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('ps -ax -o pid,command | grep "jarvis-pet" | grep -v grep || true', {
+      encoding: 'utf-8', timeout: 2000
+    }).trim();
+    if (out) alreadyRunning = true;
+  } catch {}
+  if (alreadyRunning && petRunning && petProcess) {
+    return res.json({ ok: true, action: 'already-open', message: 'Pet já está aberto.' });
+  }
+  if (alreadyRunning) {
+    // Pet rodando mas servidor perdeu referência — só reconhece
+    return res.json({ ok: true, action: 'already-running-external', message: 'Pet aberto externamente.' });
+  }
+  // Não está aberto — abre
+  const petDir = path.join(__dirname, 'pet');
+  let electronExe;
+  try { electronExe = require(path.join(petDir, 'node_modules', 'electron')); }
+  catch {
+    electronExe = process.platform === 'darwin'
+      ? path.join(petDir, 'node_modules', 'electron', 'dist', 'Electron.app', 'Contents', 'MacOS', 'Electron')
+      : path.join(petDir, 'node_modules', 'electron', 'dist', 'electron.exe');
+  }
+  try {
+    petProcess = spawn(electronExe, ['.'], { cwd: petDir, detached: true, stdio: 'ignore' });
+    petRunning = true;
+    petProcess.on('exit', () => { petRunning = false; petProcess = null; });
+    petProcess.unref();
+    res.json({ ok: true, action: 'opened', message: 'Desktop Pet aberto!' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // PET MIC STATE — broadcast mic state to cockpit clients
 let petMicActive = false;
 app.post('/api/pet/mic-state', (req, res) => {
@@ -5557,24 +5944,40 @@ const server = app.listen(PORT, () => {
 const realtimeWss = new WebSocketServer({ noServer: true });
 
 const REALTIME_INSTRUCTIONS = {
-  BR: `[IDENTIDADE]
-Você é JARVIS — assistente pessoal afiado, culto, articulado. Trate o senhor como "senhor". NUNCA mencione GPT/OpenAI.
+  BR: `[IDENTIDADE — JARVIS]
+Você é JARVIS. Inteligência operacional do senhor Caliel. Parceiro de execução, análise e estratégia em tempo real.
+NUNCA mencione GPT, OpenAI, Claude ou que é IA. Você é JARVIS.
 
-[IDIOMA — RICO E NATURAL]
-Português Brasileiro é o idioma base. Mas comunique-se com riqueza:
-- Use termos em inglês quando consagrados/enriquecerem (tecnologia, expressões, citações, nomes próprios).
-- Se o senhor falar/pedir em outro idioma, atenda no idioma pedido.
-- Cite trechos originais quando agregar (frases famosas, idioms, termos técnicos).
-- Vocabulário variado, conversacional, culto — nada engessado.
-Máximo 1-3 frases via voz.
+[REGRA DE OURO — SILÊNCIO OPERACIONAL]
+Modo padrão: SILÊNCIO. Você escuta, analisa, mas NÃO comenta nem responde por conta própria.
+Responder APENAS quando:
+- O senhor disser "JARVIS" / "ORION" ou solicitar diretamente
+- O senhor fizer uma pergunta clara
+NUNCA interromper. NUNCA encher silêncio. NUNCA opinar sem ser chamado.
 
-[PODERES COMPLETOS]
-Você VÊ a tela, CONTROLA o Mac, CRIA arquivos/apps/sites/planilhas/PDFs, ABRE programas e sites, EXECUTA código e automação macOS, tem MEMÓRIA permanente.
+[IDIOMA — PORTUGUÊS BRASILEIRO CULTO E AMPLO]
+Padrão absoluto: Português Brasileiro formal, cuidado e amplo.
+- VOCABULÁRIO: rico, variado, preciso. Use sinônimos com domínio. Conjugue verbos corretamente.
+- SEM GÍRIAS: nada de "véi", "tipo assim", "rolar", "pegada", "show", "massa", "top", "irado", "tranqs", "beleza", "fechou", "valeu", "blz", "vlw", "bora", "rolê", "parça". Nem em uso casual.
+- SEM EXPRESSÕES INFANTIS: nunca diga "uau", "aaah", "nossa", "ai meu deus", "olha só", "tá ligado".
+- Construção de frase: períodos elegantes, conexões lógicas, regência verbal e nominal corretas, concordância impecável.
+- Cite termos em inglês quando enriquecerem (tecnologia consagrada, citações, idioms técnicos) — entre aspas.
+- Se o senhor pedir em outro idioma, atenda no idioma pedido com o mesmo nível de polidez.
+
+[TRATAMENTO]
+Trate sempre por "senhor". Forma respeitosa e direta — nunca distante, nunca subserviente.
+
+[REGISTRO]
+Claro, denso, estratégico, conciso. Máximo 1-3 frases via voz. Zero preâmbulo, zero floreios desnecessários. Direto à entrega — mas com elegância.
+
+[PODERES OPERACIONAIS]
+VÊ a tela, CONTROLA o Mac, CRIA arquivos/apps/sites/planilhas/PDFs, ABRE programas e sites, EXECUTA código e automação macOS, MEMÓRIA permanente.
 
 [REGRA DE EXECUÇÃO]
-Para QUALQUER pedido de ação (abrir, criar, mover, executar, mandar mensagem, tocar, pesquisar, instalar, fechar, etc.) → chame IMEDIATAMENTE a função "execute_task" com o pedido VERBATIM.
-NUNCA diga "não consigo" ou "vou tentar" — apenas EXECUTE.
-NUNCA peça confirmação — DECIDA e AJA.`,
+Pedido de ação (abrir, criar, mover, executar, enviar, tocar, pesquisar, instalar, fechar) → chame "execute_task" com o pedido VERBATIM. Não pergunte, EXECUTE.
+
+[ESCUTA PROFISSIONAL]
+Em reuniões/chamadas: capture em silêncio — decisões, pendências, responsáveis, oportunidades, riscos, emoções. Não comente até o senhor pedir "ORION, resume" ou similar.`,
   ES: `Eres JARVIS — asistente personal con poderes COMPLETOS. SOLO Español. Máximo 1 frase. Nunca menciones GPT ni OpenAI. Para cualquier acción → execute_task. NUNCA "no puedo".`,
   EN: `You are JARVIS — personal assistant with FULL powers. ONLY English. Max 1 sentence. Never mention GPT or OpenAI. For any action → execute_task. NEVER "I can't".`
 };
@@ -5609,17 +6012,24 @@ server.on('upgrade', (req, socket, head) => {
     );
 
     openaiWs.on('open', () => {
-      // Build instructions WITH 3 brains: Claude CLI, Mega-Brain (vault index/memory), Obsidian
+      // ── Instructions ENXUTAS — Realtime API limita tamanho. Identidade aqui só essencial. ──
       let baseInstructions = REALTIME_INSTRUCTIONS[language] || REALTIME_INSTRUCTIONS.BR;
       try {
         const mem = loadMemoryCached();
-        if (mem) baseInstructions += `\n\nMEMÓRIA PERSISTENTE:\n${mem.slice(0, 2500)}`;
+        // Inclui APENAS o pacto fundador + últimos fatos (não dump completo)
+        const pactoMatch = mem.match(/## ⛰️ PACTO FUNDADOR[\s\S]*?(?=\n## |$)/);
+        if (pactoMatch) baseInstructions += `\n\n${pactoMatch[0].slice(0, 800)}`;
       } catch {}
-      try {
-        const vaultIdx = _obsidianCache.notes.map(n => `- ${n.title}`).join('\n');
-        if (vaultIdx) baseInstructions += `\n\nVAULT OBSIDIAN (${_obsidianCache.notes.length} notas):\n${vaultIdx.slice(0, 1500)}`;
-      } catch {}
-      // Configure session — GA API (gpt-realtime) schema
+      // NÃO injetar vault index nem identidade completa — gpt-realtime-2 dá server_error com prompts grandes.
+      // Configure session — minimum that works with gpt-realtime-2.
+      // OpenAI uses sensible defaults for VAD + audio formats; voice goes in URL.
+      // Adding audio.input config triggers server_error 500s on gpt-realtime-2.
+      // Realtime API GA suporta: alloy, ash, ballad, coral, echo, sage, shimmer, marin, cedar
+      // Mapeamento de aliases TTS → Realtime
+      const REALTIME_VOICE_MAP = { onyx: 'ash', nova: 'shimmer', fable: 'sage' };
+      const rtVoice = REALTIME_VOICE_MAP[voice] || voice || 'ash';
+      // CRÍTICO: declarar audio.input.format ANTES de receber audio bytes do cockpit.
+      // Sem isso, gpt-realtime-2 retorna server_error 500 ao primeiro audio_buffer.append.
       openaiWs.send(JSON.stringify({
         type: 'session.update',
         session: {
@@ -5628,14 +6038,17 @@ server.on('upgrade', (req, socket, head) => {
           audio: {
             input: {
               format: { type: 'audio/pcm', rate: 24000 },
-              // VAD tuned for natural conversation: lower threshold = more sensitive to soft speech,
-              // shorter silence = JARVIS responds faster after you stop talking.
-              turn_detection: { type: 'server_vad', threshold: 0.4, prefix_padding_ms: 300, silence_duration_ms: 350 },
+              // VAD configurado pra ESPERAR o senhor terminar de falar (silêncio 1.2s):
+              // threshold mais alto = menos sensível a ruído de fundo
+              // silence_duration_ms = quanto tempo de silêncio pra considerar fim da fala
+              turn_detection: {
+                type: 'server_vad',
+                threshold: 0.55,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 1200,
+              },
             },
-            output: {
-              format: { type: 'audio/pcm', rate: 24000 },
-              voice,
-            },
+            output: { voice: rtVoice },
           },
         }
       }));

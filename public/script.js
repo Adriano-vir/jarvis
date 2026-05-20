@@ -633,7 +633,7 @@ let mediaRecorder = null;
 let audioChunks = [];
 let currentAttachment = null;
 let voiceEnabled = true;
-let ttsVoice = localStorage.getItem('ttsVoice') || 'ash';
+let ttsVoice = localStorage.getItem('ttsVoice') || 'onyx';
 let voiceRealtimeAvailable = false;
 let _autoVoiceStarted = false; // fires once on page load
 
@@ -930,9 +930,133 @@ function addTerminalLine(text, type = '') {
   line.appendChild(msg);
   terminal.appendChild(line);
   terminal.scrollTop = terminal.scrollHeight;
+
+  // Mirror into side-chat panel (Projetos tab)
+  try { _mirrorToSideChat(text, type); } catch {}
+  try { _mirrorToJarvisPanel(text, type); } catch {}
+}
+
+// Espelha mensagens no chat lateral da aba Projetos
+function _mirrorToSideChat(text, type = '') {
+  const out = document.getElementById('side-chat-output');
+  if (!out) return;
+  const cls = type.includes('user') ? 'user'
+            : type.includes('jarvis') ? 'jarvis'
+            : type.includes('error') ? 'error' : 'system';
+  const div = document.createElement('div');
+  div.className = `sc-line ${cls}`;
+  const ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = getTimestamp();
+  div.appendChild(ts);
+  div.appendChild(document.createTextNode(' ' + (text || '')));
+  out.appendChild(div);
+  out.scrollTop = out.scrollHeight;
+  // Cap to 200 lines pra performance
+  while (out.childElementCount > 200) out.removeChild(out.firstChild);
 }
 
 let pendingAckTTS = null; // Track ACK that needs TTS
+
+// ════════════════════════════════════════════════════════════════════
+//   JARVIS PANEL — terminal de comando + chat + transcript live
+// ════════════════════════════════════════════════════════════════════
+function _jpAppend(target, text, type = 'system') {
+  const out = document.getElementById(target);
+  if (!out) return;
+  const div = document.createElement('div');
+  div.className = `jp-line ${type}`;
+  const ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = (new Date()).toTimeString().slice(0,8);
+  div.appendChild(ts);
+  div.appendChild(document.createTextNode(' ' + (text || '')));
+  out.appendChild(div);
+  out.scrollTop = out.scrollHeight;
+  while (out.childElementCount > 200) out.removeChild(out.firstChild);
+}
+
+function _mirrorToJarvisPanel(text, type = '') {
+  // Tudo do terminal principal → jp-cmd-body (área do chat de comando)
+  const cls = type.includes('user') ? 'user'
+            : type.includes('jarvis') ? 'jarvis'
+            : type.includes('error') ? 'error' : 'system';
+  _jpAppend('jp-cmd-body', text, cls);
+}
+
+// Hook pra mostrar transcrição em tempo real na coluna de "OUVINDO"
+window._jpUpdateMicStatus = (state) => {
+  const el = document.getElementById('jp-mic-status');
+  if (!el) return;
+  const labels = {
+    listening: 'escutando...',
+    thinking: 'processando...',
+    speaking: 'JARVIS falando...',
+    idle: '— inativo',
+  };
+  el.textContent = labels[state] || '— ' + state;
+};
+window._jpHeard = (text, isFinal = true) => {
+  if (!text || !text.trim()) return;
+  // Remove "interim" placeholders
+  const existing = document.querySelectorAll('#jp-transcript-body .jp-line.heard-interim');
+  existing.forEach(e => e.remove());
+  // Remove empty
+  document.querySelectorAll('#jp-transcript-body .jp-empty').forEach(e => e.remove());
+  _jpAppend('jp-transcript-body', text.trim(), isFinal ? 'heard' : 'heard-interim');
+};
+
+// Atualiza info bar a cada 5s
+async function _jpRefreshInfo() {
+  try {
+    const r = await fetch('/api/self/status');
+    if (!r.ok) return;
+    const d = await r.json();
+    const els = {
+      server: 'OK · PID ' + d.pid,
+      rt: voiceRealtimeAvailable ? 'gpt-realtime-2' : 'STT',
+      mem: d.memory_chars + ' chars',
+      vault: d.vault_total_notes + ' notas',
+      uptime: Math.floor(d.uptime_s / 60) + 'min',
+    };
+    for (const [k, v] of Object.entries(els)) {
+      const el = document.getElementById('jp-info-' + k);
+      if (el) el.textContent = v;
+    }
+  } catch {}
+}
+setInterval(_jpRefreshInfo, 5000);
+setTimeout(_jpRefreshInfo, 2000);
+
+// Wiring: input + botão de comando do painel
+window.addEventListener('DOMContentLoaded', () => {
+  const input = document.getElementById('jp-cmd-input');
+  const btn = document.getElementById('jp-cmd-send');
+  if (input && btn) {
+    const send = () => {
+      const v = input.value.trim();
+      if (!v) return;
+      input.value = '';
+      sendMessage(v);
+    };
+    btn.addEventListener('click', send);
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+  }
+  // Ações rápidas
+  document.querySelectorAll('[data-jp-action]').forEach(b => {
+    b.addEventListener('click', () => {
+      const a = b.dataset.jpAction;
+      if (a === 'status')   sendMessage('ORION qual seu estado');
+      if (a === 'restart')  sendMessage('ORION reinicie');
+      if (a === 'pet')      fetch('/api/pet/ensure-open', { method: 'POST' }).then(()=>_jpAppend('jp-cmd-body','🐾 Pet aberto','system'));
+      if (a === 'meeting')  sendMessage('reunião');
+      if (a === 'memory')   sendMessage('ORION resuma o que sabe sobre mim em 3 bullets');
+      if (a === 'vault')    sendMessage('ORION liste 5 notas mais relevantes do meu vault sobre meu trabalho');
+    });
+  });
+});
 
 // ========== MODEL CARD HIGHLIGHTING ==========
 function setActiveModel(model) {
@@ -1064,6 +1188,77 @@ async function sendMessage(text, fromVoice = false) {
 
   userGestureReceived = true;
   pendingAckTTS = null;
+  // Lazy-start clap detection on first user gesture
+  if (typeof startClapDetection === 'function' && !window._clapStarted) {
+    window._clapStarted = true;
+    startClapDetection();
+  }
+
+  // Meeting mode triggers (capturados antes de enviar pro Claude)
+  const lower = text.trim().toLowerCase();
+  if (/^reuni[aã]o\b|^iniciar reuni[aã]o\b|^modo reuni[aã]o\b/.test(lower)) {
+    startMeetingMode();
+    return;
+  }
+  if (/^fim reuni[aã]o\b|^encerrar reuni[aã]o\b|^terminar reuni[aã]o\b|^parar reuni[aã]o\b/.test(lower)) {
+    await stopMeetingMode();
+    return;
+  }
+
+  // ═══ AUTONOMIA — comandos de auto-modificação via voz ═══
+  // "ORION conserte X" | "JARVIS conserte X" | "se conserte X" | "autoconserte X"
+  const selfFixMatch = text.match(/^(?:orion|jarvis)?[,.\s]*(?:se\s+)?(?:conserte|auto[-\s]?conserte|corrija|conserta|arruma|melhora|melhore|atualiza|atualize|modifica|modifique|adicione|adiciona|implementa|implemente)\s+(.+)/i);
+  if (selfFixMatch && /\b(se|jarvis|orion|c[oó]digo|servidor|jarvis|sistema|voz|cockpit|memoria)\b/i.test(text)) {
+    const instruction = selfFixMatch[1].trim();
+    addTerminalLine(`🛠️ [ORION self-fix] "${instruction.slice(0,80)}"`, 'info-line');
+    try {
+      const r = await fetch('/api/self/fix', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instruction, restart: true })
+      });
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const txt = dec.decode(value);
+        for (const line of txt.split('\n').filter(l=>l.trim())) addTerminalLine(line, 'system-line');
+      }
+      addTerminalLine('🛠️ Servidor reiniciando — recarrega o Chrome em 5s', 'info-line');
+      setTimeout(() => location.reload(), 5000);
+    } catch (e) { addTerminalLine('[error] self-fix: ' + e.message, 'error-line'); }
+    return;
+  }
+
+  // "ORION reinicie" | "ORION restart"
+  if (/^(?:orion|jarvis)[,.\s]+(?:reinicie?|restart|relance|relanc[aá]|liga\s+de\s+novo)/i.test(text)) {
+    addTerminalLine('🔄 [ORION] Reiniciando servidor...', 'info-line');
+    try {
+      await fetch('/api/self/restart', { method: 'POST' });
+      setTimeout(() => location.reload(), 4000);
+    } catch (e) { addTerminalLine('[error] restart: ' + e.message, 'error-line'); }
+    return;
+  }
+
+  // "ORION qual seu estado" | "ORION diagnostico" | "ORION status"
+  if (/^(?:orion|jarvis)[,.\s]+(?:qual\s+(?:o\s+)?(?:seu\s+)?estado|status|diagn[oó]stico|sa[uú]de|como\s+(?:vc\s+)?(?:est[aá]|t[aá])|qual\s+(?:o\s+)?seu)/i.test(text)) {
+    addTerminalLine('🔍 [ORION self-status]', 'info-line');
+    try {
+      const r = await fetch('/api/self/status');
+      const s = await r.json();
+      const lines = [
+        `Identidade: ${s.identity}`,
+        `Uptime: ${Math.floor(s.uptime_s / 60)}min · PID ${s.pid} · ${s.memory_mb}MB`,
+        `Código: server.js ${s.codebase.server_js_lines} linhas · ${s.codebase.endpoints} endpoints`,
+        `Vaults: ${s.vault_total_notes} notas em 3 cérebros`,
+        `Pools: Opus×${s.pools.opus} Sonnet×${s.pools.sonnet} Haiku×${s.pools.haiku} · ${s.pools.errors} errors`,
+        `Memória: ${s.memory_chars} chars persistentes`,
+      ];
+      for (const l of lines) addTerminalLine(l, 'jarvis-line');
+      if (voiceEnabled && userGestureReceived) speakResponse(`Operacional. Versão ${s.identity}, ${Math.floor(s.uptime_s/60)} minutos de uptime, ${s.vault_total_notes} notas, pools quentes.`);
+    } catch (e) { addTerminalLine('[error] status: ' + e.message, 'error-line'); }
+    return;
+  }
   const displayText = text.trim() || (currentLang === 'BR' ? '[análise de tela]' : '[screen analysis]');
   addTerminalLine(`> ${displayText}`, 'user-line');
   chatInput.value = '';
@@ -1124,8 +1319,6 @@ async function sendMessage(text, fromVoice = false) {
     let buffer = '';
     let claudeSilent = false;   // true after [build-start] — Claude output is terminal-only
     let gptResponse = '';       // GPT-mini portion (before [build-start]) — this gets spoken
-    let streamTtsBuffer = '';
-    let streamTtsFired = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1148,22 +1341,8 @@ async function sendMessage(text, fromVoice = false) {
         if (!claudeSilent) gptResponse += line + '\n';
       }
 
-      // Streaming TTS: fire on ACK portion regardless of claudeSilent state
-      if (!streamTtsFired && voiceEnabled && userGestureReceived && ackPortion.trim()) {
-        const cleanAck = ackPortion.split('\n')
-          .filter(l => !l.match(/^\[(system|file|error|warn|info|ack|build-start|translated)\]/))
-          .join(' ').trim();
-        if (cleanAck) {
-          streamTtsBuffer += cleanAck + ' ';
-          // Fire TTS as soon as possible: first clause ending with .!?,: OR 18+ chars accumulated
-          const sentMatch = streamTtsBuffer.match(/^(.{6,}?[.!?,:])\s/);
-          const bufTrim = streamTtsBuffer.trim();
-          if (sentMatch || (hadBuildStart && bufTrim.length > 6) || bufTrim.length >= 18) {
-            streamTtsFired = true;
-            speakResponse((sentMatch ? sentMatch[1] : bufTrim).trim());
-          }
-        }
-      }
+      // Streaming TTS REMOVIDO — causava cortes ("Senhor," → fim).
+      // Agora speakResponse roda APENAS no final, com resposta inteira.
     }
 
     if (buffer.trim() && !buffer.startsWith('[build-start]')) processStreamLine(buffer);
@@ -1183,12 +1362,9 @@ async function sendMessage(text, fromVoice = false) {
       addTerminalLine(cleanGpt, 'jarvis-line');
       playReceiveSound();
       highlightAgents(cleanGpt);
-      // Speak GPT-mini response if streaming TTS didn't already fire
-      if (voiceEnabled && userGestureReceived && !streamTtsFired) {
-        const brief = cleanGpt.replace(/```[\s\S]*?```/g, '').replace(/[#*_`~>|]/g, '')
-          .replace(/\n+/g, ' ').trim()
-          .split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 5).slice(0, 2).join(' ').slice(0, 300);
-        if (brief) await speakResponse(brief);
+      // Speak resposta COMPLETA. _ttsPlayFull cuida do chunking sem cortar.
+      if (voiceEnabled && userGestureReceived) {
+        speakResponse(cleanGpt);
       }
     }
 
@@ -1366,9 +1542,11 @@ function _handleRealtimeEvent(ev) {
     }
     if (ev.type === 'response.audio_transcript.done' && ev.transcript) {
       addTerminalLine(ev.transcript, 'jarvis-line');
+      try { window._meetingHookTranscript?.('ORION', ev.transcript); } catch {}
     }
     if (ev.type === 'conversation.item.input_audio_transcription.completed' && ev.transcript) {
       addTerminalLine('> ' + ev.transcript, 'user-line');
+      try { window._meetingHookTranscript?.('user', ev.transcript); } catch {}
       // Ambient learning: record what user said + current screen context to memory
       fetch('/api/observation', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1418,14 +1596,29 @@ async function startRealtime() {
       stopRealtime();
       if (realtimeUserDisabled) return; // usuário desligou manualmente
 
+      // Sem acesso ou rate limit → STT permanente
       if (ev.code === 4000 || ev.code === 4001 || ev.code === 4003 || ev.code === 1013) {
-        // Sem acesso Realtime ou rate limit — cai para STT contínuo
         voiceRealtimeAvailable = false;
         addTerminalLine('[system] Realtime indisponível (' + ev.code + ') — usando STT contínuo', 'system-line');
         _activateContinuousSTT();
         return;
       }
-      // Queda inesperada — reconecta automaticamente
+
+      // Track consecutive unexpected closes — fall back to STT after 2 failures
+      window._rtCloseStreak = (window._rtCloseStreak || 0) + 1;
+      window._rtCloseLastAt = Date.now();
+      // Reset streak if last close was >60s ago (genuine network blip, not server issue)
+      setTimeout(() => {
+        if (Date.now() - window._rtCloseLastAt > 60000) window._rtCloseStreak = 0;
+      }, 65000);
+
+      if (window._rtCloseStreak >= 2) {
+        addTerminalLine('[system] Realtime instável (server bug OpenAI) — usando STT imediato', 'system-line');
+        voiceRealtimeAvailable = false; // pára de tentar Realtime nesta sessão
+        _activateContinuousSTT();
+        return;
+      }
+
       if (wasActive) {
         addTerminalLine('[system] Reconectando...', 'system-line');
         setTimeout(() => {
@@ -1575,22 +1768,43 @@ async function startRecording() {
       webSpeechRec.lang = ({ BR: 'pt-BR', ES: 'es-ES', EN: 'en-US' }[currentLang]) || 'en-US';
       webSpeechRec.interimResults = true;
       webSpeechRec.maxAlternatives = 1;
-      webSpeechRec.continuous = false;
+      // Continuous=true → acumula fala mesmo com pausas curtas (respiração, vírgula)
+      webSpeechRec.continuous = true;
 
       let finalSent = false;
+      let accumulated = '';     // acumula múltiplos `final` results em uma sentença completa
+      let silenceTimer = null;
+      const SILENCE_MS = 1500;  // espera 1.5s de silêncio REAL pra confirmar fim da fala
+
+      const sendAccumulated = () => {
+        if (finalSent) return;
+        const full = accumulated.trim();
+        if (!full || full.length < 2) return;
+        finalSent = true;
+        chatInput.value = full;
+        try { window._jpHeard?.(full, true); window._jpUpdateMicStatus?.('thinking'); } catch {}
+        try { webSpeechRec?.stop(); } catch {}
+        stopRecording();
+        sendMessage(full, true);
+      };
+
       webSpeechRec.onresult = (event) => {
-        let interim = '', final = '';
+        let interim = '', newFinal = '';
         for (let i = event.resultIndex; i < event.results.length; i++) {
-          if (event.results[i].isFinal) final += event.results[i][0].transcript;
+          if (event.results[i].isFinal) newFinal += event.results[i][0].transcript;
           else interim += event.results[i][0].transcript;
         }
-        if (interim) chatInput.value = interim;
-        if (final && !finalSent) {
-          finalSent = true;
-          chatInput.value = final;
-          stopRecording();
-          sendMessage(final.trim(), true);
+        // Mostra parcial em tempo real no input
+        if (interim) chatInput.value = (accumulated + ' ' + interim).trim();
+        if (newFinal) {
+          accumulated = (accumulated + ' ' + newFinal).trim();
+          chatInput.value = accumulated;
         }
+        // Painel JARVIS: transcript live
+        try { window._jpUpdateMicStatus?.('listening'); window._jpHeard?.(accumulated + (interim ? ' ' + interim : ''), false); } catch {}
+        // Reset timer SEMPRE que detectar atividade (mesmo interim)
+        if (silenceTimer) clearTimeout(silenceTimer);
+        silenceTimer = setTimeout(sendAccumulated, SILENCE_MS);
       };
 
       webSpeechRec.onerror = (e) => {
@@ -1607,9 +1821,17 @@ async function startRecording() {
           micBtn.classList.remove('recording');
           setAvatarState('idle');
           webSpeechRec = null;
-          // Continuous mode: restart after brief pause
+          // Continuous mode: restart after brief pause — but NOT while JARVIS is speaking (anti-echo)
           if (continuousMode) {
-            continuousTimer = setTimeout(() => startRecording(), 200);
+            const restartDelay = window._jarvisIsSpeaking ? 800 : 200;
+            continuousTimer = setTimeout(() => {
+              if (window._jarvisIsSpeaking) {
+                // JARVIS still speaking — keep waiting
+                continuousTimer = setTimeout(() => { if (continuousMode && !window._jarvisIsSpeaking) startRecording(); }, 400);
+                return;
+              }
+              if (continuousMode) startRecording();
+            }, restartDelay);
           }
         }
       };
@@ -1798,77 +2020,241 @@ async function transcribeAndSend(audioBlob) {
   }
 }
 
-// ========== TTS PIPELINE (SERIAL QUEUE — prevents double-voice overlap) ==========
+// ════════════════════════════════════════════════════════════════════
+//   TTS PIPELINE — voz fluida, sem cortes
+//   - Fala resposta COMPLETA (sem trunc em 3 sentences / 500 chars)
+//   - Chunking inteligente pra textos longos (mantém sentenças inteiras)
+//   - Queue serial (sem overlap de áudio)
+//   - Retry 1x em erro de rede
+//   - Anti-echo robusto (500ms grace + STT stop)
+// ════════════════════════════════════════════════════════════════════
 let _ttsQueue = Promise.resolve();
 let _currentAudio = null;
+window._jarvisIsSpeaking = false;
 
 function speakResponse(text) {
-  // Enqueue — each call waits for the previous to finish before starting
-  _ttsQueue = _ttsQueue.then(() => _ttsPlay(text)).catch(() => _ttsPlay(text));
+  if (!text || !text.trim()) return Promise.resolve();
+  _ttsQueue = _ttsQueue.then(() => _ttsPlayFull(text)).catch(err => {
+    console.warn('[TTS] queue error:', err?.message);
+  });
   return _ttsQueue;
 }
 
-async function _ttsPlay(text) {
-  // Clean text for TTS — remove code blocks, markdown, bracket prefixes
-  const cleanText = text
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/\[.*?\]/g, '')
-    .replace(/[#*_`~>|]/g, '')
-    .replace(/\n+/g, ' ')
+// Limpa texto pra TTS — sem cortar significado
+function _ttsClean(text) {
+  return text
+    .replace(/```[\s\S]*?```/g, '')           // code blocks
+    .replace(/\[[a-z][^\]]*\]/gi, '')          // [system], [file], [info] etc — só tags
+    .replace(/[#*_`~>|]/g, '')                 // markdown
+    .replace(/[🛠️🔄🔍📋📁🎙🎤🔊⛰️🧠📚📓🟢🟡🔴✅❌⚠️▸◉●]/g, '') // emojis
+    .replace(/\s+/g, ' ')                      // whitespace
     .trim();
+}
 
-  // Split into sentences, max 3 for voice brevity
-  const sentences = cleanText
-    .split(/(?<=[.!?])\s+/)
-    .filter(s => s.trim().length > 5)
-    .slice(0, 3);
+// Split em sentenças mantendo a pontuação. Cada sentença inteira.
+function _ttsSplitSentences(text) {
+  return text.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map(s => s.trim()).filter(s => s.length > 0) || [text];
+}
 
-  if (sentences.length === 0) return;
+// Quebra texto em chunks ≤ MAX_CHARS, SEM cortar no meio de sentenças
+function _ttsChunk(text, maxChars = 600) {
+  const sentences = _ttsSplitSentences(text);
+  const chunks = [];
+  let buf = '';
+  for (const s of sentences) {
+    if ((buf + ' ' + s).length > maxChars && buf) {
+      chunks.push(buf.trim());
+      buf = s;
+    } else {
+      buf = buf ? `${buf} ${s}` : s;
+    }
+  }
+  if (buf) chunks.push(buf.trim());
+  return chunks;
+}
 
-  // Combine into one TTS call for speed (avoid multiple round-trips)
-  const ttsText = sentences.join(' ').slice(0, 500);
+async function _ttsPlayFull(text) {
+  const clean = _ttsClean(text);
+  if (!clean) return;
+
+  // Fala TODA a resposta, sem truncar. Apenas hard cap em 2500 chars pra evitar TTS abusivo.
+  const final = clean.slice(0, 2500);
+  const chunks = _ttsChunk(final, 600);
 
   setAvatarState('speaking');
+  window._jarvisIsSpeaking = true;
+  try { if (window.webSpeechRec) window.webSpeechRec.stop(); } catch {}
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-
-    const res = await fetch('/api/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: ttsText, language: currentLang, voice: ttsVoice }),
-      signal: controller.signal
-    });
-
-    clearTimeout(timeout);
-
-    if (!res.ok) {
-      console.error('TTS failed:', res.status);
-      setAvatarState('idle');
-      return;
+  for (const chunk of chunks) {
+    try {
+      await _ttsPlayChunk(chunk);
+    } catch (e) {
+      console.warn('[TTS] chunk failed, retrying once:', e?.message);
+      try { await _ttsPlayChunk(chunk); } catch {}
     }
-
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-
-    await new Promise((resolve) => {
-      const audio = new Audio(url);
-      _currentAudio = audio;
-      audio.onended = () => { _currentAudio = null; URL.revokeObjectURL(url); resolve(); };
-      audio.onerror = () => { _currentAudio = null; URL.revokeObjectURL(url); resolve(); };
-      audio.play().catch((e) => {
-        console.warn('Audio autoplay blocked:', e.message);
-        _currentAudio = null;
-        URL.revokeObjectURL(url);
-        resolve();
-      });
-    });
-  } catch (err) {
-    console.error('TTS error:', err.message);
   }
 
-  setAvatarState('idle');
+  // Grace period 500ms antes de liberar STT (anti-echo robusto)
+  setTimeout(() => {
+    window._jarvisIsSpeaking = false;
+    if (!realtimeActive && !_currentAudio) setAvatarState('idle');
+  }, 500);
+}
+
+async function _ttsPlayChunk(text) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  let res;
+  try {
+    res = await fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, language: currentLang, voice: ttsVoice }),
+      signal: controller.signal,
+    });
+  } finally { clearTimeout(timeout); }
+  if (!res.ok) throw new Error('TTS HTTP ' + res.status);
+
+  const blob = await res.blob();
+  if (blob.size < 100) throw new Error('TTS blob too small'); // bad response
+  const url = URL.createObjectURL(blob);
+
+  return new Promise((resolve, reject) => {
+    const audio = new Audio(url);
+    _currentAudio = audio;
+    let resolved = false;
+    const finish = (err) => {
+      if (resolved) return;
+      resolved = true;
+      _currentAudio = null;
+      URL.revokeObjectURL(url);
+      err ? reject(err) : resolve();
+    };
+    audio.onended = () => finish();
+    audio.onerror = () => finish(new Error('audio error'));
+    audio.play().catch(e => {
+      // Autoplay blocked — não é erro fatal, só não toca
+      console.warn('[TTS] autoplay blocked:', e.message);
+      finish();
+    });
+  });
+}
+
+// ========== MEETING MODE — escuta passiva + resumos periódicos ==========
+window.rt2Transcript = window.rt2Transcript || [];
+let _meetingActive = false;
+let _meetingSummaryInterval = null;
+let _meetingStartedAt = 0;
+
+function startMeetingMode() {
+  if (_meetingActive) {
+    addTerminalLine('[reunião] já está ativa', 'system-line');
+    return;
+  }
+  _meetingActive = true;
+  _meetingStartedAt = Date.now();
+  window.rt2Transcript = [];
+  addTerminalLine('🎤 [REUNIÃO ATIVA] ORION em escuta silenciosa. Capturando tudo. Diga "ORION" para falar; "fim reunião" para encerrar.', 'info-line');
+
+  // Resumo parcial a cada 4 min
+  _meetingSummaryInterval = setInterval(() => generateMeetingSummary(false), 4 * 60 * 1000);
+
+  // Hook nos eventos Realtime pra acumular transcripts
+  if (typeof realtimeWs !== 'undefined' && realtimeWs) {
+    addTerminalLine('[reunião] Realtime: VAD ativo, create_response suprimido', 'system-line');
+    // Suprime auto-response do Realtime
+    try {
+      _rtSend({ type: 'session.update', session: { type: 'realtime', turn_detection: { type: 'server_vad', create_response: false } } });
+    } catch {}
+  }
+}
+
+async function stopMeetingMode() {
+  if (!_meetingActive) return;
+  _meetingActive = false;
+  if (_meetingSummaryInterval) { clearInterval(_meetingSummaryInterval); _meetingSummaryInterval = null; }
+  const durationMin = Math.round((Date.now() - _meetingStartedAt) / 60000);
+  addTerminalLine(`📋 [REUNIÃO ENCERRADA] Duração ${durationMin}min · Gerando resumo final...`, 'info-line');
+
+  // Re-habilita create_response do Realtime
+  try { _rtSend({ type: 'session.update', session: { type: 'realtime', turn_detection: { type: 'server_vad', create_response: true } } }); } catch {}
+
+  await generateMeetingSummary(true);
+  window.rt2Transcript = [];
+}
+
+async function generateMeetingSummary(isFinal) {
+  if (window.rt2Transcript.length === 0) { addTerminalLine('[reunião] sem transcripts capturados', 'system-line'); return; }
+  const transcript = window.rt2Transcript.slice(-200).map(t => `${t.role}: ${t.text}`).join('\n');
+  const promptStyle = isFinal
+    ? `Resumo FINAL da reunião (markdown estruturado):
+1. **Pontos-chave** (até 5)
+2. **Decisões tomadas**
+3. **Plano de ação** (responsável + prazo se mencionado)
+4. **Próximos passos**
+5. **Riscos/oportunidades detectados**`
+    : `Resumo PARCIAL (até agora): pontos discutidos, decisões emergindo, ações cogitadas. Máximo 5 bullets.`;
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `${promptStyle}\n\nTRANSCRIPT:\n${transcript.slice(-8000)}`, language: 'BR' })
+    });
+    const text = await r.text();
+    addTerminalLine(`📋 [${isFinal ? 'RESUMO FINAL' : 'RESUMO PARCIAL'}]\n${text}`, 'jarvis-line');
+  } catch (e) { addTerminalLine('[reunião] erro no resumo: ' + e.message, 'error-line'); }
+}
+
+// Hook Realtime transcription completion → push to rt2Transcript
+window._meetingHookTranscript = function(role, text) {
+  if (_meetingActive && text && text.trim()) {
+    window.rt2Transcript.push({ role, text: text.trim(), ts: Date.now() });
+  }
+};
+
+// ========== CLAP DETECTION — duplo palmas ativa Realtime ==========
+let _clapCtx = null, _clapAnalyser = null, _clapStream = null;
+let _clapLastAt = 0;
+async function startClapDetection() {
+  if (_clapCtx) return;
+  try {
+    _clapStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false } });
+    _clapCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const src = _clapCtx.createMediaStreamSource(_clapStream);
+    _clapAnalyser = _clapCtx.createAnalyser();
+    _clapAnalyser.fftSize = 512;
+    src.connect(_clapAnalyser);
+    const data = new Uint8Array(_clapAnalyser.fftSize);
+    const RMS_THRESHOLD = 0.35;
+    const CLAP_WINDOW_MS = 1800;
+    function tick() {
+      if (!_clapCtx) return;
+      _clapAnalyser.getByteTimeDomainData(data);
+      // RMS
+      let sumSq = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sumSq += v * v;
+      }
+      const rms = Math.sqrt(sumSq / data.length);
+      const now = Date.now();
+      if (rms > RMS_THRESHOLD) {
+        const diff = now - _clapLastAt;
+        if (diff > 80 && diff < CLAP_WINDOW_MS) {
+          // 2 claps in window
+          _clapLastAt = 0;
+          addTerminalLine('👏👏 [clap] Realtime ativado por palmas', 'info-line');
+          if (typeof startRealtime === 'function' && !realtimeActive && !realtimeConnecting) {
+            startRealtime().catch(()=>{});
+          }
+        } else {
+          _clapLastAt = now;
+        }
+      }
+      requestAnimationFrame(tick);
+    }
+    tick();
+  } catch (e) { console.warn('clap detection failed:', e.message); }
 }
 
 // ========== WAKE WORD DETECTION ==========
@@ -1884,8 +2270,9 @@ function startWakeWord() {
   wakeWordRecognition.onresult = (event) => {
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const transcript = event.results[i][0].transcript.toLowerCase();
-      // Detect "jarvis" in any pronunciation (jarvis, járvis, jarvís)
-      if (transcript.includes('jarvis') || transcript.includes('járvis') || transcript.includes('jarves')) {
+      // Detect "orion" (primary) + legacy "jarvis" pronunciations
+      if (transcript.includes('orion') || transcript.includes('óri') || transcript.includes('hori') ||
+          transcript.includes('jarvis') || transcript.includes('járvis') || transcript.includes('jarves')) {
         if (!realtimeActive && !realtimeConnecting && !isRecording) {
           addTerminalLine('[info] 🎤 JARVIS ativado por voz', 'info-line');
           if (voiceRealtimeAvailable) {
@@ -2173,7 +2560,27 @@ chatInput.addEventListener('keydown', (e) => {
   }
 });
 
-micBtn.addEventListener('click', async () => {
+// Side-chat (aba Projetos) — mesma função sendMessage
+const sideChatInput = document.getElementById('side-chat-input');
+const sideChatSend = document.getElementById('side-chat-send');
+if (sideChatInput && sideChatSend) {
+  const sendSideChat = () => {
+    const v = sideChatInput.value.trim();
+    if (!v) return;
+    sideChatInput.value = '';
+    sendMessage(v);
+  };
+  sideChatSend.addEventListener('click', sendSideChat);
+  sideChatInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendSideChat();
+    }
+  });
+}
+
+micBtn.addEventListener('click', async (e) => {
+  e.preventDefault();
   userGestureReceived = true;
 
   // ── DESLIGAR: qualquer modo ativo ──
@@ -2239,15 +2646,10 @@ if (!window._jarvisAlwaysOnWatchdog) {
   window._jarvisAlwaysOnWatchdog = setInterval(() => {
     if (realtimeUserDisabled) return;
     if (realtimeActive || realtimeConnecting || continuousMode || isRecording) return;
-    // Prefer Realtime (streaming audio); fallback STT only if Realtime fails
+    // Decisão definitiva: STT puro, sem tentar Realtime auto (server bug OpenAI persistente)
     micBtn.classList.add('recording');
     setAvatarState('listening');
-    if (voiceRealtimeAvailable) {
-      addTerminalLine('[ambient] 🎙 ativando Realtime', 'system-line');
-      startRealtime().catch(() => _activateContinuousSTT());
-    } else {
-      _activateContinuousSTT();
-    }
+    _activateContinuousSTT();
   }, 8000);
 }
 
@@ -2261,31 +2663,8 @@ function _activateContinuousSTT() {
   addTerminalLine('[system] ✅ Modo voz ativo — pode falar', 'system-line');
   if (!isRecording) startRecording();
 
-  // Auto-upgrade: if Realtime becomes available again, switch back automatically
-  if (window._rtRecoveryInterval) clearInterval(window._rtRecoveryInterval);
-  window._rtRecoveryInterval = setInterval(async () => {
-    if (!continuousMode || realtimeActive || realtimeConnecting || realtimeUserDisabled) return;
-    try {
-      const r = await fetch('/api/health', { signal: AbortSignal.timeout(2000) });
-      const d = await r.json();
-      if (d.capabilities?.voice_realtime) {
-        // Quick probe — try a real Realtime connection
-        const test = new WebSocket(`ws://${location.host}/api/realtime/ws?language=${currentLang}&voice=${getRealtimeVoice()}`);
-        let ok = false;
-        test.onmessage = (e) => { try { if (JSON.parse(e.data).type === 'session.updated') ok = true; } catch {} };
-        await new Promise(r => setTimeout(r, 2500));
-        try { test.close(); } catch {}
-        if (ok && continuousMode && !realtimeActive) {
-          addTerminalLine('[system] ⚡ Realtime disponível — upgrade automático', 'system-line');
-          continuousMode = false;
-          if (isRecording) try { stopRecording(); } catch {}
-          clearInterval(window._rtRecoveryInterval);
-          window._rtRecoveryInterval = null;
-          startRealtime().catch(() => _activateContinuousSTT());
-        }
-      }
-    } catch {}
-  }, 60000); // probe once per minute
+  // Realtime retry desabilitado — server bug OpenAI persistente, STT é o modo padrão estável.
+  // Realtime continua disponível via clique manual no botão do mic.
 }
 
 // Terminal direct input
@@ -2669,7 +3048,8 @@ initRealtimeBtn();
           if (sVoice) { sVoice.textContent = 'OFF'; sVoice.style.color = '#ff4455'; }
         }
 
-        // ── Auto-activate Realtime voice (true streaming audio, no chunked recording) ──
+        // ── Auto-activate Realtime 2 (FIX: audio.input.format declarado no servidor)
+        // Fallback automático pra STT se Realtime falhar.
         if (!_autoVoiceStarted && !realtimeActive && !realtimeConnecting && !realtimeUserDisabled) {
           _autoVoiceStarted = true;
           userGestureReceived = true;

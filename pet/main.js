@@ -1,4 +1,8 @@
-const { app, BrowserWindow, ipcMain, Menu, shell, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, shell, screen, session } = require('electron');
+
+// Autoplay sem precisar de gesto + atalho pra getUserMedia funcionar
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+app.commandLine.appendSwitch('enable-features', 'GetUserMedia');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -30,6 +34,13 @@ function fetchJSON(url) {
   });
 }
 
+function grantPermissions(ses) {
+  // Garante mic / camera / audio capture / notifications sem dialog
+  const granted = new Set(['media', 'microphone', 'audioCapture', 'camera', 'clipboard-read', 'clipboard-sanitized-write', 'notifications', 'display-capture']);
+  ses.setPermissionRequestHandler((_wc, permission, callback) => callback(granted.has(permission)));
+  ses.setPermissionCheckHandler((_wc, permission) => granted.has(permission));
+}
+
 function createWindow() {
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
 
@@ -44,11 +55,28 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.js'),
+      // Permite getUserMedia em context isolado
+      webSecurity: false,
+      allowRunningInsecureContent: true,
     },
   });
 
+  // Concede permissões ANTES de carregar o HTML
+  grantPermissions(mainWindow.webContents.session);
+  grantPermissions(session.defaultSession);
+
   mainWindow.loadFile('pet.html');
   mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+
+  // Dispara getUserMedia silencioso no load — força concessão de permissão macOS TCC pra Electron
+  mainWindow.webContents.on('did-finish-load', () => {
+    mainWindow.webContents.executeJavaScript(`
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(s => { s.getTracks().forEach(t => t.stop()); console.log('[pet] mic OK'); })
+        .catch(e => console.warn('[pet] mic:', e.message));
+    `).catch(()=>{});
+  });
+
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 

@@ -421,42 +421,238 @@ async function pollStatus() {
 pollStatus();
 setInterval(pollStatus, 10000);
 
-// === MIC BUTTON — Toggle Cowork + Voice ===
+// AUTO-ARM MIC ao abrir o pet (24/7 sempre escutando)
+// Aguarda 2s pra DOM + permissões settled, depois ativa
+window.addEventListener('DOMContentLoaded', () => {
+  setTimeout(async () => {
+    if (micActive) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(t => t.stop());
+      setMicVisual(true, 'JARVIS — Escutando...');
+      startSTT();
+      // Notifica servidor
+      fetch('http://localhost:3000/api/pet/mic-state', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active: true })
+      }).catch(()=>{});
+      fetch('http://localhost:3000/api/cowork/start', { method: 'POST' }).catch(()=>{});
+    } catch(e) { console.warn('[pet] auto-arm mic failed:', e.message); }
+  }, 2000);
+});
+
+// ════════════════════════════════════════════════════════════════════
+//   PET AUTÔNOMO — captura mic local + envia /api/chat + toca TTS
+//   Funciona com cockpit FECHADO. Pet é a interface mínima viável.
+// ════════════════════════════════════════════════════════════════════
 const micBtn = document.getElementById('mic-btn');
 let micActive = false;
+let webSpeechRec = null;
+let petIsSpeaking = false;
+let currentAudio = null;
+const SILENCE_MS = 1500;
+
+function setMicVisual(active, label) {
+  micActive = active;
+  micBtn.classList.toggle('active', active);
+  micBtn.querySelector('svg').setAttribute('stroke', active ? '#0f0' : '#c084fc');
+  currentState = active ? 'listening' : (petIsSpeaking ? 'speaking' : 'idle');
+  if (label) tooltip.textContent = label;
+}
+
+// TTS helper — toca resposta inteira, sem cortes
+async function playTTS(text) {
+  if (!text || !text.trim()) return;
+  try {
+    petIsSpeaking = true;
+    currentState = 'speaking';
+    tooltip.textContent = 'JARVIS — Falando...';
+    // Stop active STT to avoid echo
+    try { webSpeechRec?.stop(); } catch {}
+    const cleanText = text.replace(/\[[a-z][^\]]*\]/gi, '').replace(/```[\s\S]*?```/g, '')
+      .replace(/[#*_`~>|]/g, '').replace(/\s+/g, ' ').trim().slice(0, 2500);
+    if (!cleanText) { petIsSpeaking = false; return; }
+    const r = await fetch('http://localhost:3000/api/tts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: cleanText, voice: 'onyx', language: 'BR' })
+    });
+    if (!r.ok) { petIsSpeaking = false; return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    await new Promise(resolve => {
+      const audio = new Audio(url);
+      currentAudio = audio;
+      const done = () => { URL.revokeObjectURL(url); currentAudio = null; resolve(); };
+      audio.onended = done; audio.onerror = done;
+      audio.play().catch(done);
+    });
+  } catch(e) { console.warn('[pet] TTS:', e.message); }
+  // Grace 500ms antes de reativar STT (anti-echo)
+  setTimeout(() => {
+    petIsSpeaking = false;
+    if (micActive) startSTT();
+    else { currentState = 'idle'; tooltip.textContent = 'JARVIS — Online'; }
+  }, 500);
+}
+
+// Send transcript to /api/chat + speak response
+async function sendToJarvis(text) {
+  if (!text || !text.trim()) return;
+  currentState = 'thinking';
+  tooltip.textContent = 'JARVIS — Processando...';
+  try {
+    const r = await fetch('http://localhost:3000/api/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, language: 'BR', fromVoice: true })
+    });
+    let buf = '';
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value);
+    }
+    // Strip [build-start] and Claude background output — speak only GPT-mini ack/answer
+    const beforeBuild = buf.split('[build-start]')[0];
+    const speakText = beforeBuild.split('\n')
+      .filter(l => !/^\[(system|file|error|warn|info|ack|translated)\]/i.test(l))
+      .join(' ').trim();
+    if (speakText) await playTTS(speakText);
+  } catch(e) { console.warn('[pet] chat:', e.message); }
+}
+
+// MediaRecorder + Whisper STT — funciona em Electron (Web Speech não funciona)
+// Grava áudio até silêncio prolongado → envia pra /api/stt → recebe transcript
+let mediaRec = null;
+let audioChunks = [];
+let mediaStream = null;
+let silenceTimer = null;
+let audioCtxStt = null;
+let analyserStt = null;
+let analyserStream = null;
+
+async function startSTT() {
+  if (petIsSpeaking) return;
+  try {
+    if (!mediaStream) {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+    }
+
+    // Setup VAD com AnalyserNode pra detectar silêncio
+    audioCtxStt = new (window.AudioContext || window.webkitAudioContext)();
+    analyserStream = audioCtxStt.createMediaStreamSource(mediaStream);
+    analyserStt = audioCtxStt.createAnalyser();
+    analyserStt.fftSize = 512;
+    analyserStream.connect(analyserStt);
+    const data = new Uint8Array(analyserStt.fftSize);
+
+    audioChunks = [];
+    mediaRec = new MediaRecorder(mediaStream, { mimeType: 'audio/webm' });
+    mediaRec.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+    mediaRec.onstop = async () => {
+      if (audioChunks.length === 0) return;
+      const blob = new Blob(audioChunks, { type: 'audio/webm' });
+      audioChunks = [];
+      if (blob.size < 2000) {
+        // Áudio muito curto = só ruído, ignora
+        if (micActive && !petIsSpeaking) setTimeout(startSTT, 300);
+        return;
+      }
+      // Envia pra Whisper
+      currentState = 'thinking';
+      tooltip.textContent = 'JARVIS — Transcrevendo...';
+      try {
+        const fd = new FormData();
+        fd.append('audio', blob, 'voice.webm');
+        fd.append('language', 'pt');
+        const r = await fetch('http://localhost:3000/api/stt', { method: 'POST', body: fd });
+        const data = await r.json();
+        const text = (data.text || '').trim();
+        if (text && text.length > 2) {
+          await sendToJarvis(text);
+        }
+      } catch(e) { console.warn('[pet] STT:', e.message); }
+      // Recomeça se mic ainda ativo
+      if (micActive && !petIsSpeaking) setTimeout(startSTT, 200);
+    };
+
+    mediaRec.start();
+    tooltip.textContent = 'JARVIS — Escutando...';
+    currentState = 'listening';
+
+    // VAD loop: detecta silêncio prolongado
+    let lastSpeechAt = Date.now();
+    let speechDetected = false;
+    const VAD_THRESHOLD = 12; // RMS médio (0-128)
+    const SILENCE_AFTER_SPEECH_MS = 1500;
+    const MAX_RECORD_MS = 30000;
+    const startedAt = Date.now();
+
+    const vadTick = () => {
+      if (!mediaRec || mediaRec.state !== 'recording') return;
+      analyserStt.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += Math.abs(data[i] - 128);
+      const rms = sum / data.length;
+
+      if (rms > VAD_THRESHOLD) {
+        lastSpeechAt = Date.now();
+        speechDetected = true;
+      }
+
+      const now = Date.now();
+      const recordedFor = now - startedAt;
+      const silenceFor = now - lastSpeechAt;
+
+      // Para gravar se: (a) detectou fala e teve 1.5s de silêncio depois, ou (b) >30s gravando
+      if ((speechDetected && silenceFor > SILENCE_AFTER_SPEECH_MS) || recordedFor > MAX_RECORD_MS) {
+        try { mediaRec.stop(); } catch {}
+        try { audioCtxStt?.close(); } catch {}
+        audioCtxStt = null;
+        return;
+      }
+      requestAnimationFrame(vadTick);
+    };
+    requestAnimationFrame(vadTick);
+
+  } catch(e) {
+    console.warn('[pet] startSTT failed:', e.message);
+    tooltip.textContent = 'JARVIS — Erro mic';
+  }
+}
+
+function stopSTT() {
+  try { mediaRec?.stop(); } catch {}
+  try { audioCtxStt?.close(); } catch {}
+  try { mediaStream?.getTracks().forEach(t => t.stop()); } catch {}
+  mediaRec = null;
+  audioCtxStt = null;
+  mediaStream = null;
+}
 
 micBtn.addEventListener('mousedown', (e) => e.stopPropagation()); // prevent drag
 micBtn.addEventListener('click', async (e) => {
   e.stopPropagation();
-  micActive = !micActive;
-  micBtn.classList.toggle('active', micActive);
-  micBtn.querySelector('svg').setAttribute('stroke', micActive ? '#0f0' : '#c084fc');
-  currentState = micActive ? 'listening' : 'idle';
-  tooltip.textContent = micActive ? 'JARVIS — Escutando...' : 'JARVIS — Online';
-
-  try {
-    // Toggle cowork mode on server
-    const endpoint = micActive ? '/api/cowork/start' : '/api/cowork/stop';
-    await fetch('http://localhost:3000' + endpoint, { method: 'POST' });
-
-    // Toggle voice on cockpit via server event
-    if (micActive) {
-      // Notify cockpit to start listening
-      await fetch('http://localhost:3000/api/pet/mic-state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ active: true })
-      });
-    } else {
-      await fetch('http://localhost:3000/api/pet/mic-state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ active: false })
-      });
-    }
-  } catch(err) {
-    console.log('Mic toggle error:', err);
+  const newState = !micActive;
+  setMicVisual(newState, newState ? 'JARVIS — Escutando...' : 'JARVIS — Online');
+  if (newState) {
+    // Garante mic permission via getUserMedia (Electron já libera)
+    try { const s = await navigator.mediaDevices.getUserMedia({ audio: true }); s.getTracks().forEach(t=>t.stop()); } catch(e) { console.warn('[pet] mic perm:', e.message); }
+    startSTT();
+  } else {
+    stopSTT();
   }
+  // Cowork ambient via server (continua ativo independente do cockpit)
+  try {
+    await fetch('http://localhost:3000/api/cowork/' + (newState ? 'start' : 'stop'), { method: 'POST' });
+    await fetch('http://localhost:3000/api/pet/mic-state', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active: newState })
+    });
+  } catch {}
 });
 
 // === DRAG via IPC ===
