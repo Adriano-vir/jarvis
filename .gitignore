@@ -1,27 +1,53 @@
+# Dependencies
 node_modules/
+pet/node_modules/
+launcher/node_modules/
+.cache/
+
+# Environment
 .env
 .env.*
+
+# OS
+.DS_Store
+*.pyc
+__pycache__/
+
+# Logs & errors
 *.log
+*.err
+
+# Persistent state (user-specific, not versioned)
 system/JARVIS-MEMORY.md
 system/JARVIS-HISTORY.json
 system/FELIPE-MEMORY.md
 system/FELIPE-HISTORY.json
+system/CALIEL-MEMORY.md
 system/memory-embeddings.json
+system/memory-embeddings.json.bak
 system/last-audio*
 system/workflows/
+system/.wa-session/
+
+# Generated artifacts
 Documents and Projects/
-pet/node_modules/
-sensors/
-launcher/node_modules/
+dist/
 launcher/dist/
 launcher/build/
-.cache/
+sensors/
+
+# Platform-specific
 *.exe
-*.xlsx
 *.pdb
+*.xlsx
 jarvis-autostart.vbs
 jarvis-service.bat
+
+# Local PDFs (não-source)
+*.pdf
+
+# IDE / Claude local
+.vscode/
+.idea/
 .claude/settings.local.json
-__pycache__/
-*.pyc
 gen-pdf-guide.cjs
